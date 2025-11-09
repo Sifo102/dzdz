@@ -1,0 +1,118 @@
+name: RDP
+on:
+  workflow_dispatch:
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 10080
+    steps:
+      - name: Configure RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+          Restart-Service -Name TermService -Force
+          Write-Host "✅ RDP configured successfully"
+
+      - name: Create User Account
+        run: |
+          $password = "P@ssw0rd123"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          Remove-LocalUser -Name "SIFODZ" -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+          New-LocalUser -Name "SIFODZ" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "SIFODZ"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "SIFODZ"
+          Enable-LocalUser -Name "SIFODZ"
+          echo "RDP_USER=SIFODZ" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Download and Setup Ngrok
+        run: |
+          # Download Ngrok
+          $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
+          $ngrokZip = "$env:TEMP\ngrok.zip"
+          $ngrokDir = "C:\ngrok"
+          
+          Invoke-WebRequest -Uri $ngrokUrl -OutFile $ngrokZip
+          
+          # Create directory and extract
+          New-Item -ItemType Directory -Path $ngrokDir -Force
+          Expand-Archive -Path $ngrokZip -DestinationPath $ngrokDir -Force
+          Remove-Item $ngrokZip -Force
+          
+          # Add to PATH
+          $env:Path += ";$ngrokDir"
+          [Environment]::SetEnvironmentVariable("Path", $env:Path, [System.EnvironmentVariableTarget]::Machine)
+          
+          Write-Host "✅ Ngrok downloaded and installed"
+
+      - name: Start Ngrok Tunnel
+        run: |
+          # Start Ngrok tunnel for RDP
+          $ngrokProcess = Start-Process -FilePath "C:\ngrok\ngrok.exe" -ArgumentList "tcp 3389" -PassThru -WindowStyle Hidden
+          echo "NGROK_PID=$($ngrokProcess.Id)" >> $env:GITHUB_ENV
+          Write-Host "✅ Ngrok tunnel started (PID: $($ngrokProcess.Id))"
+          
+          # Wait for tunnel to establish
+          Start-Sleep -Seconds 10
+          
+          # Get tunnel information
+          try {
+              $tunnelInfo = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 10
+              $publicUrl = $tunnelInfo.tunnels[0].public_url
+              echo "NGROK_URL=$publicUrl" >> $env:GITHUB_ENV
+              Write-Host "🌐 Ngrok Public URL: $publicUrl"
+          } catch {
+              Write-Host "⚠️ Could not get Ngrok URL, but tunnel is running"
+              echo "NGROK_URL=check_ngrok_dashboard" >> $env:GITHUB_ENV
+          }
+
+      - name: Display Connection Information
+        run: |
+          Write-Host ""
+          Write-Host "🎯 ==================== RDP CONNECTION ===================="
+          Write-Host "👤 Username: $env:RDP_USER"
+          Write-Host "🔑 Password: $env:RDP_PASSWORD"
+          Write-Host "🌐 Ngrok URL: $env:NGROK_URL"
+          Write-Host "💡 Instructions:"
+          Write-Host "   1. Copy the Ngrok URL (e.g., tcp://0.tcp.ngrok.io:12345)"
+          Write-Host "   2. Extract hostname and port"
+          Write-Host "   3. Use in RDP client: hostname:port"
+          Write-Host "   4. Or visit: https://dashboard.ngrok.com/status/tunnels"
+          Write-Host "⏰ Duration: 7 DAYS"
+          Write-Host "========================================================"
+          Write-Host ""
+
+      - name: Maintain RDP Connection
+        run: |
+          $startTime = Get-Date
+          Write-Host "🔄 RDP Server is running via Ngrok tunnel..."
+          
+          while ($true) {
+              $currentTime = Get-Date
+              $elapsed = $currentTime - $startTime
+              $hours = [math]::Round($elapsed.TotalHours, 1)
+              
+              # Check RDP service
+              $termService = Get-Service -Name TermService
+              if ($termService.Status -ne 'Running') {
+                  Write-Host "🔄 Restarting Terminal Services..."
+                  Start-Service -Name TermService
+              }
+              
+              # Try to get Ngrok status periodically
+              if ([int](Get-Date -Format 'mm') % 10 -eq 0) {
+                  try {
+                      $tunnelInfo = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 5
+                      $publicUrl = $tunnelInfo.tunnels[0].public_url
+                      Write-Host "🔗 Ngrok Tunnel: $publicUrl"
+                  } catch {
+                      Write-Host "⚠️ Ngrok status unavailable"
+                  }
+              }
+              
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP Active - $hours hours - User: $env:RDP_USER"
+              Start-Sleep -Seconds 300
+          }
