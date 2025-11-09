@@ -1,11 +1,6 @@
 name: RDP
 on:
   workflow_dispatch:
-    inputs:
-      zerotier_network:
-        description: 'ZeroTier Network ID'
-        required: true
-        type: string
 jobs:
   secure-rdp:
     runs-on: windows-latest
@@ -41,21 +36,23 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart", "ALLUSERS=1" -Wait
           Remove-Item $installerPath -Force
           Start-Sleep -Seconds 15
-          Write-Host "✅ ZeroTier installed successfully"
-
-      - name: Join ZeroTier Network Using Service
-        run: |
-          $networkId = "${{ github.event.inputs.zerotier_network }}"
           
-          if (-not $networkId) {
-              Write-Host "❌ No ZeroTier Network ID provided"
-              Write-Host "📋 Create a network at: https://my.zerotier.com"
-              exit 1
+          # Check what services are installed
+          $services = Get-Service | Where-Object { $_.Name -like "*ZeroTier*" -or $_.DisplayName -like "*ZeroTier*" }
+          if ($services) {
+              Write-Host "✅ ZeroTier services found:"
+              $services | ForEach-Object { Write-Host "   - $($_.Name): $($_.Status)" }
+          } else {
+              Write-Host "⚠️ No ZeroTier services found, but installation completed"
           }
+
+      - name: Join ZeroTier Network
+        run: |
+          $networkId = "54b8caa5df"  # Using your network ID directly
           
           Write-Host "🔗 Joining ZeroTier network: $networkId"
           
-          # Method 1: Create network config file (most reliable)
+          # Create network config file
           $configDir = "$env:ProgramData\ZeroTier\One\networks.d"
           New-Item -ItemType Directory -Path $configDir -Force
           $configFile = "$configDir\$networkId.conf"
@@ -63,9 +60,27 @@ jobs:
           
           Write-Host "✅ Created network config file"
           
-          # Restart service to apply changes
-          Restart-Service -Name "ZeroTier One Service" -Force
-          Write-Host "✅ ZeroTier service restarted"
+          # Find and restart ZeroTier service
+          $ztService = Get-Service | Where-Object { $_.Name -like "*ZeroTier*" -or $_.DisplayName -like "*ZeroTier*" } | Select-Object -First 1
+          
+          if ($ztService) {
+              Write-Host "🔄 Restarting ZeroTier service: $($ztService.Name)"
+              Restart-Service -Name $ztService.Name -Force
+              Write-Host "✅ ZeroTier service restarted"
+          } else {
+              Write-Host "⚠️ ZeroTier service not found, trying to start manually"
+              # Try common service names
+              $commonNames = @("ZeroTierOneService", "ZeroTier One", "ZeroTier")
+              foreach ($name in $commonNames) {
+                  try {
+                      Start-Service -Name $name -ErrorAction SilentlyContinue
+                      Write-Host "✅ Started service: $name"
+                      break
+                  } catch {
+                      # Continue trying
+                  }
+              }
+          }
           
           # Wait for connection
           Write-Host "🔄 Waiting for network connection (30 seconds)..."
@@ -78,15 +93,16 @@ jobs:
           $maxAttempts = 10
           
           for ($i = 1; $i -le $maxAttempts; $i++) {
-              # Method: Check network adapters for ZeroTier
-              $adapters = Get-NetAdapter -Name "ZeroTier*" -ErrorAction SilentlyContinue
+              # Check network adapters for ZeroTier
+              $adapters = Get-NetAdapter | Where-Object { $_.Name -like "*ZeroTier*" -or $_.InterfaceDescription -like "*ZeroTier*" }
               
               if ($adapters) {
+                  Write-Host "✅ Found ZeroTier adapter: $($adapters.Name)"
                   foreach ($adapter in $adapters) {
                       $ipAddresses = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
                       if ($ipAddresses -and $ipAddresses.IPAddress) {
                           $ztIP = $ipAddresses.IPAddress
-                          Write-Host "✅ Found ZeroTier IP via network adapter: $ztIP"
+                          Write-Host "✅ Found ZeroTier IP: $ztIP"
                           break
                       }
                   }
@@ -115,7 +131,7 @@ jobs:
           Write-Host "🎯 ==================== ZEROTIER RDP ===================="
           Write-Host "👤 Username: SIFODZ"
           Write-Host "🔑 Password: P@ssw0rd123"
-          Write-Host "🌐 ZeroTier Network: ${{ github.event.inputs.zerotier_network }}"
+          Write-Host "🌐 ZeroTier Network: 54b8caa5df"
           
           if ($env:ZEROTIER_IP -and $env:ZEROTIER_IP -ne "pending_approval") {
               Write-Host "📍 ZeroTier IP: $env:ZEROTIER_IP"
@@ -123,7 +139,7 @@ jobs:
               Write-Host ""
               Write-Host "🔧 HOW TO CONNECT:"
               Write-Host "   1. Install ZeroTier from: https://www.zerotier.com/download/"
-              Write-Host "   2. Join network: ${{ github.event.inputs.zerotier_network }}"
+              Write-Host "   2. Join network: 54b8caa5df"
               Write-Host "   3. Go to https://my.zerotier.com"
               Write-Host "   4. Authorize BOTH devices (this one and yours)"
               Write-Host "   5. Connect RDP to: $env:ZEROTIER_IP"
@@ -134,7 +150,7 @@ jobs:
               Write-Host ""
               Write-Host "📋 REQUIRED ACTION:"
               Write-Host "   1. Go to: https://my.zerotier.com"
-              Write-Host "   2. Find network: ${{ github.event.inputs.zerotier_network }}"
+              Write-Host "   2. Find network: 54b8caa5df"
               Write-Host "   3. Check the 'Auth' checkbox for this device"
               Write-Host "   4. Wait 1-2 minutes for IP assignment"
               Write-Host "   5. Refresh this page to see the IP"
@@ -168,15 +184,15 @@ jobs:
               }
               
               # Monitor ZeroTier service
-              $ztService = Get-Service -Name "ZeroTier One Service" -ErrorAction SilentlyContinue
-              if (-not $ztService -or $ztService.Status -ne 'Running') {
+              $ztService = Get-Service | Where-Object { $_.Name -like "*ZeroTier*" -or $_.DisplayName -like "*ZeroTier*" } | Select-Object -First 1
+              if ($ztService -and $ztService.Status -ne 'Running') {
                   Write-Host "🔄 Starting ZeroTier Service..."
-                  Start-Service -Name "ZeroTier One Service" -ErrorAction SilentlyContinue
+                  Start-Service -Name $ztService.Name -ErrorAction SilentlyContinue
               }
               
               # Update IP display if it was pending
               if ($env:ZEROTIER_IP -eq "pending_approval") {
-                  $adapters = Get-NetAdapter -Name "ZeroTier*" -ErrorAction SilentlyContinue
+                  $adapters = Get-NetAdapter | Where-Object { $_.Name -like "*ZeroTier*" -or $_.InterfaceDescription -like "*ZeroTier*" }
                   if ($adapters) {
                       $ipAddresses = Get-NetIPAddress -InterfaceIndex $adapters.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
                       if ($ipAddresses -and $ipAddresses.IPAddress) {
