@@ -37,15 +37,12 @@ jobs:
           # Update DuckDNS with your domain and token
           $duckdnsToken = "6057ecf3-d13f-4440-9544-466fee7eb60b"
           $duckdnsDomain = "sifogmlj"
-          $duckdnsUrl = "$duckdnsDomain.duckdns.org"
           
           $updateUrl = "https://www.duckdns.org/update?domains=$duckdnsDomain&token=$duckdnsToken&ip=$publicIP"
           $result = Invoke-RestMethod -Uri $updateUrl
           
           if ($result -eq "OK") {
-              Write-Host "✅ DuckDNS updated successfully: $duckdnsUrl -> $publicIP"
-              # Save to file instead of environment variable
-              Set-Content -Path "$env:GITHUB_WORKSPACE\connection.txt" -Value "RDP Connection Information:`n`nAddress: $duckdnsUrl:3389`nUsername: SIFODZ`nPassword: P@ssw0rd123`nPublic IP: $publicIP"
+              Write-Host "✅ DuckDNS updated successfully: sifogmlj.duckdns.org -> $publicIP"
           } else {
               Write-Host "❌ DuckDNS update failed: $result"
               exit 1
@@ -53,17 +50,16 @@ jobs:
 
       - name: Display Connection Information
         run: |
-          $duckdnsUrl = "sifogmlj.duckdns.org"
           Write-Host ""
           Write-Host "🎯 ==================== RDP CONNECTION READY ===================="
           Write-Host "👤 Username: SIFODZ"
           Write-Host "🔑 Password: P@ssw0rd123"
-          Write-Host "🌐 Address: $duckdnsUrl:3389"
-          Write-Host "📡 Public IP: 52.154.130.209"
+          Write-Host "🌐 Address: sifogmlj.duckdns.org:3389"
+          Write-Host "📡 Public IP: 52.190.140.96"
           Write-Host ""
           Write-Host "🔧 HOW TO CONNECT:"
           Write-Host "   1. Open Remote Desktop Connection (press Windows + R, type 'mstsc')"
-          Write-Host "   2. In Computer field enter: $duckdnsUrl:3389"
+          Write-Host "   2. In Computer field enter: sifogmlj.duckdns.org:3389"
           Write-Host "   3. Username: SIFODZ"
           Write-Host "   4. Password: P@ssw0rd123"
           Write-Host "   5. Click Connect"
@@ -74,12 +70,12 @@ jobs:
 
       - name: Maintain RDP Service
         run: |
-          $duckdnsUrl = "sifogmlj.duckdns.org"
           $startTime = Get-Date
           Write-Host "🔄 RDP Server is running and waiting for connections..."
-          Write-Host "📍 Connect to: $duckdnsUrl:3389"
+          Write-Host "📍 Connect to: sifogmlj.duckdns.org:3389"
           Write-Host "👤 Username: SIFODZ"
           Write-Host "🔑 Password: P@ssw0rd123"
+          Write-Host ""
           
           while ($true) {
               $currentTime = Get-Date
@@ -102,13 +98,13 @@ jobs:
                       $updateUrl = "https://www.duckdns.org/update?domains=$duckdnsDomain&token=$duckdnsToken&ip=$publicIP"
                       $result = Invoke-RestMethod -Uri $updateUrl
                       if ($result -eq "OK") {
-                          Write-Host "🔄 DuckDNS updated: $duckdnsDomain.duckdns.org -> $publicIP"
+                          Write-Host "🔄 DuckDNS updated: sifogmlj.duckdns.org -> $publicIP"
                       }
                   } catch {
                       Write-Host "⚠️ DuckDNS update failed, will retry later"
                   }
               }
               
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ RDP Active - $hours hours - Address: $duckdnsUrl:3389"
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ RDP Active - $hours hours - Address: sifogmlj.duckdns.org:3389"
               Start-Sleep -Seconds 60
           }
