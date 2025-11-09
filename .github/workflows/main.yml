@@ -1,4 +1,4 @@
-name: RDP
+name: RDP with Auto Telegram Bot
 on:
   workflow_dispatch:
 jobs:
@@ -12,7 +12,7 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
           netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
-          netsh advfirewall firewall add rule name="RDP-ZeroTier" dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name="RDP-Bot" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
           Write-Host "✅ RDP configured successfully"
 
@@ -28,160 +28,520 @@ jobs:
           Enable-LocalUser -Name "SIFODZ"
           Write-Host "✅ User account created"
 
-      - name: Install ZeroTier
+      - name: Install Python and Packages
         run: |
-          $zerotierUrl = "https://download.zerotier.com/dist/ZeroTier%20One.msi"
-          $installerPath = "$env:TEMP\zerotier.msi"
-          Invoke-WebRequest -Uri $zerotierUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart", "ALLUSERS=1" -Wait
+          # Download and install Python silently
+          $pythonUrl = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
+          $installerPath = "$env:TEMP\python-installer.exe"
+          
+          Invoke-WebRequest -Uri $pythonUrl -OutFile $installerPath
+          Start-Process -FilePath $installerPath -ArgumentList "/quiet", "InstallAllUsers=1", "PrependPath=1", "Include_test=0", "Include_pip=1" -Wait
           Remove-Item $installerPath -Force
-          Write-Host "✅ ZeroTier installed successfully"
+          
+          # Wait for installation and refresh environment
+          Start-Sleep -Seconds 15
+          refreshenv
+          
+          # Upgrade pip and install all required packages
+          python -m pip install --upgrade pip
+          pip install requests telethon python-telegram-bot pyrogram tweepy beautifulsoup4 selenium pillow numpy pandas opencv-python flask django fastapi sqlalchemy psutil pyautogui
+          
+          Write-Host "✅ Python and all packages installed successfully"
 
-      - name: Join ZeroTier Network
+      - name: Create Bot Startup Script
         run: |
-          $networkId = "54b8caa5df"
+          # Create bot directory
+          $botDir = "C:\TelegramBot"
+          New-Item -ItemType Directory -Path $botDir -Force
           
-          Write-Host "🔗 Joining ZeroTier network: $networkId"
-          
-          # Create network config file - this is the most reliable method
-          $configDir = "$env:ProgramData\ZeroTier\One\networks.d"
-          New-Item -ItemType Directory -Path $configDir -Force
-          $configFile = "$configDir\$networkId.conf"
-          Set-Content -Path $configFile -Value ""
-          
-          Write-Host "✅ Created network config file"
-          Write-Host "✅ ZeroTier will automatically connect to the network"
-          Write-Host "📋 Please authorize this device at: https://my.zerotier.com/network/54b8caa5df"
+          # Create the bot script
+          $botScript = @'
+import os, json, time, threading, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+from urllib import request, parse
 
-      - name: Wait for ZeroTier Connection
+TOKEN = "8407863189:AAFymLb1zhM4Gq2q7YSIKhV5M37K8eTunRk"
+BASE = "https://api.telegram.org/bot" + TOKEN
+GETUPDATES = BASE + "/getUpdates"
+SENDMSG = BASE + "/sendMessage"
+OFFSET_FILE = os.path.expanduser("~/.sifo_bot_offset")
+
+UPLOAD_FOLDER = "telegram_bot_files"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+active_processes = {}
+file_status = {}
+process_outputs = {}
+
+LONG_POLL = 10
+MAX_WORKERS = 25
+
+def get_main_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "📤 رفع ملف بايثون"}],
+            [{"text": "📁 عرض الملفات"}],
+            [{"text": "📦 تثبيت مكتبة"}],
+            [{"text": "🔄 تحديث"}]
+        ],
+        "resize_keyboard": True
+    }
+
+def read_offset():
+    if os.path.exists(OFFSET_FILE):
+        try:
+            return int(open(OFFSET_FILE).read().strip())
+        except:
+            return None
+    return None
+
+def write_offset(v):
+    try:
+        open(OFFSET_FILE, "w").write(str(v))
+    except:
+        pass
+
+def send(chat_id, text, reply_markup=None):
+    try:
+        data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+        if reply_markup:
+            data["reply_markup"] = json.dumps(reply_markup)
+        body = parse.urlencode(data).encode()
+        req = request.Request(SENDMSG, data=body)
+        request.urlopen(req, timeout=10)
+    except:
+        pass
+
+def download_file(file_id, file_name):
+    try:
+        file_info_url = f"{BASE}/getFile?file_id={file_id}"
+        with request.urlopen(file_info_url) as response:
+            file_info = json.loads(response.read().decode())
+        
+        if file_info["ok"]:
+            file_path = file_info["result"]["file_path"]
+            download_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+            
+            with request.urlopen(download_url) as file_response:
+                file_content = file_response.read()
+            
+            local_path = os.path.join(UPLOAD_FOLDER, file_name)
+            with open(local_path, 'wb') as f:
+                f.write(file_content)
+            
+            return True
+        return False
+    except Exception as e:
+        print(f"Download error: {e}")
+        return False
+
+def run_python_file(filename, chat_id):
+    try:
+        file_path = os.path.join(UPLOAD_FOLDER, filename)
+        if not os.path.exists(file_path):
+            return f"❌ File `{filename}` not found"
+        
+        if filename in active_processes:
+            try:
+                active_processes[filename].terminate()
+                time.sleep(2)
+            except:
+                pass
+        
+        process = subprocess.Popen(
+            [sys.executable, "-u", file_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+        
+        active_processes[filename] = process
+        file_status[filename] = {
+            "status": "running",
+            "start_time": time.time(),
+            "restart_count": file_status.get(filename, {}).get("restart_count", 0) + 1,
+            "chat_id": chat_id
+        }
+        
+        threading.Thread(target=monitor_process_with_restart, args=(process, filename, chat_id), daemon=True).start()
+        threading.Thread(target=read_process_output, args=(process, filename, chat_id), daemon=True).start()
+        
+        return f"✅ Started `{filename}` successfully!\n🆔 PID: `{process.pid}`\n🔄 Auto-restart enabled"
+        
+    except Exception as e:
+        return f"❌ Run error: `{str(e)}`"
+
+def monitor_process_with_restart(process, filename, chat_id):
+    max_restarts = 10
+    restart_delay = 5
+    
+    while file_status.get(filename, {}).get("status") == "running":
+        exit_code = process.wait()
+        
+        if file_status.get(filename, {}).get("status") == "running":
+            current_restarts = file_status[filename].get("restart_count", 0)
+            
+            if current_restarts < max_restarts:
+                send(chat_id, f"🔄 Restarting `{filename}`... (Attempt {current_restarts + 1})")
+                time.sleep(restart_delay)
+                
+                try:
+                    new_process = subprocess.Popen(
+                        [sys.executable, "-u", os.path.join(UPLOAD_FOLDER, filename)],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        stdin=subprocess.PIPE,
+                        text=True,
+                        bufsize=1,
+                        universal_newlines=True
+                    )
+                    
+                    active_processes[filename] = new_process
+                    file_status[filename]["restart_count"] = current_restarts + 1
+                    file_status[filename]["start_time"] = time.time()
+                    
+                    process = new_process
+                    threading.Thread(target=read_process_output, args=(new_process, filename, chat_id), daemon=True).start()
+                    
+                    send(chat_id, f"✅ Restarted `{filename}` successfully!")
+                    
+                except Exception as e:
+                    send(chat_id, f"❌ Restart failed: `{str(e)}`")
+                    break
+            else:
+                send(chat_id, f"⏹ Stopped `{filename}` after {max_restarts} restart attempts")
+                file_status[filename]["status"] = "stopped"
+                break
+        else:
+            break
+
+def read_process_output(process, filename, chat_id):
+    try:
+        while process.poll() is None:
+            output = process.stdout.readline()
+            if output:
+                process_outputs[filename] = output.strip()
+                if any(keyword in output.lower() for keyword in ['error', 'exception', 'traceback', 'failed']):
+                    send(chat_id, f"📄 `{filename}`:\n```\n{output[-500:]}\n```")
+            
+            error_output = process.stderr.readline()
+            if error_output:
+                send(chat_id, f"❌ `{filename}` error:\n```\n{error_output[-500:]}\n```")
+                
+            time.sleep(0.1)
+    except:
+        pass
+
+def stop_file(filename):
+    try:
+        if filename in active_processes:
+            process = active_processes[filename]
+            file_status[filename]["status"] = "stopped"
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except:
+                process.kill()
+            del active_processes[filename]
+            return f"✅ Stopped `{filename}`"
+        else:
+            return "❌ File not running"
+    except Exception as e:
+        return f"❌ Stop error: `{str(e)}`"
+
+def list_files():
+    files = [f for f in os.listdir(UPLOAD_FOLDER) if f.endswith('.py')]
+    if not files:
+        return "📁 No files uploaded yet"
+    
+    result = "📁 **Uploaded Files:**\n\n"
+    for i, file in enumerate(files, 1):
+        status = "🟢 Running" if file in active_processes and active_processes[file].poll() is None else "🔴 Stopped"
+        restart_count = file_status.get(file, {}).get("restart_count", 0)
+        result += f"{i}. `{file}` - {status} (Restarts: {restart_count})\n"
+    
+    return result
+
+def install_library(lib_name):
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", lib_name],
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+        
+        if result.returncode == 0:
+            return f"✅ Installed `{lib_name}` successfully!\n\nOutput:\n```\n{result.stdout[-800:]}\n```"
+        else:
+            return f"❌ Failed to install `{lib_name}`\n\nError:\n```\n{result.stderr[-800:]}\n```"
+            
+    except subprocess.TimeoutExpired:
+        return f"⏰ Installation timeout for `{lib_name}`"
+    except Exception as e:
+        return f"❌ Installation error: `{str(e)}`"
+
+def handle_message(chat_id, text, pool):
+    if text == "📤 رفع ملف بايثون":
+        send(chat_id, "📤 **Upload Python File**\n\nSend a Python file (.py) now:\n• Auto-save\n• Auto-run with restart\n• Continuous monitoring")
+    
+    elif text == "📁 عرض الملفات":
+        files_info = list_files()
+        send(chat_id, files_info)
+        
+        files = [f for f in os.listdir(UPLOAD_FOLDER) if f.endswith('.py')]
+        for file in files:
+            status = "🟢 Running" if file in active_processes and active_processes[file].poll() is None else "🔴 Stopped"
+            keyboard = {
+                "inline_keyboard": [
+                    [
+                        {"text": "▶️ Run", "callback_data": f"run_{file}"},
+                        {"text": "⏹ Stop", "callback_data": f"stop_{file}"},
+                        {"text": "🔁 Restart", "callback_data": f"restart_{file}"}
+                    ],
+                    [
+                        {"text": "📊 Status", "callback_data": f"status_{file}"},
+                        {"text": "🗑 Delete", "callback_data": f"delete_{file}"}
+                    ]
+                ]
+            }
+            send(chat_id, f"📄 `{file}`\n📊 {status}", keyboard)
+    
+    elif text == "📦 تثبيت مكتبة":
+        send(chat_id, "📦 **Install Library**\n\nSend library name to install:\nExample: `requests` or `numpy pandas`\n\nOr use command:\n`/install library_name`")
+    
+    elif text == "🔄 تحديث":
+        send(chat_id, "🔄 **Menu Updated**", get_main_keyboard())
+    
+    elif text.startswith("/install "):
+        lib_name = text.replace("/install ", "").strip()
+        if lib_name:
+            send(chat_id, f"⏳ Installing `{lib_name}`...")
+            result = install_library(lib_name)
+            send(chat_id, result)
+        else:
+            send(chat_id, "❌ Please specify library name")
+    
+    else:
+        send(chat_id, "🚀 **Welcome to SIFO Advanced Bot!**\n\nChoose an option:", get_main_keyboard())
+
+def handle_update(upd, pool):
+    try:
+        if "message" in upd:
+            msg = upd["message"]
+            chat_id = msg.get("chat", {}).get("id")
+            text = msg.get("text", "")
+            
+            if text:
+                pool.submit(handle_message, chat_id, text, pool)
+        
+        if "message" in upd and "document" in upd["message"]:
+            doc = upd["message"]["document"]
+            chat_id = upd["message"]["chat"]["id"]
+            file_name = doc.get("file_name", "")
+            
+            if file_name.endswith('.py'):
+                file_id = doc["file_id"]
+                send(chat_id, f"⏳ Uploading `{file_name}`...")
+                
+                if download_file(file_id, file_name):
+                    send(chat_id, f"✅ Uploaded `{file_name}` successfully!\n⚡ Starting auto-run...")
+                    result = run_python_file(file_name, chat_id)
+                    send(chat_id, result)
+                else:
+                    send(chat_id, "❌ Upload failed")
+            else:
+                send(chat_id, "❌ Please upload Python files only (.py extension)")
+        
+        if "callback_query" in upd:
+            callback = upd["callback_query"]
+            chat_id = callback["message"]["chat"]["id"]
+            data = callback["data"]
+            
+            if data.startswith("run_"):
+                filename = data[4:]
+                send(chat_id, f"⚡ Starting `{filename}`...")
+                result = run_python_file(filename, chat_id)
+                send(chat_id, result)
+            
+            elif data.startswith("stop_"):
+                filename = data[5:]
+                result = stop_file(filename)
+                send(chat_id, result)
+            
+            elif data.startswith("restart_"):
+                filename = data[8:]
+                send(chat_id, f"🔁 Restarting `{filename}`...")
+                stop_file(filename)
+                time.sleep(2)
+                result = run_python_file(filename, chat_id)
+                send(chat_id, result)
+            
+            elif data.startswith("status_"):
+                filename = data[7:]
+                if filename in file_status:
+                    status = file_status[filename]
+                    uptime = time.time() - status["start_time"]
+                    status_text = f"📊 **File Status:** `{filename}`\n"
+                    status_text += f"🟢 **Status:** {status['status']}\n"
+                    status_text += f"⏱ **Uptime:** {int(uptime)} seconds\n"
+                    status_text += f"🔄 **Restarts:** {status['restart_count']}\n"
+                    if filename in active_processes:
+                        status_text += f"🆔 **PID:** {active_processes[filename].pid}"
+                    send(chat_id, status_text)
+                else:
+                    send(chat_id, f"❌ `{filename}` not running yet")
+            
+            elif data.startswith("delete_"):
+                filename = data[7:]
+                try:
+                    stop_file(filename)
+                    file_path = os.path.join(UPLOAD_FOLDER, filename)
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    if filename in file_status:
+                        del file_status[filename]
+                    send(chat_id, f"✅ Deleted `{filename}`")
+                except Exception as e:
+                    send(chat_id, f"❌ Delete error: `{str(e)}`")
+    
+    except Exception as e:
+        print(f"Update handling error: {e}")
+
+def main_loop():
+    pool = ThreadPoolExecutor(MAX_WORKERS)
+    offset = read_offset()
+    
+    print("🚀 Starting Advanced Python File Management Bot...")
+    print("⚡ Auto-restart feature enabled")
+    print("📁 Files folder:", UPLOAD_FOLDER)
+    
+    while True:
+        try:
+            params = {"timeout": LONG_POLL, "limit": 100}
+            if offset is not None:
+                params["offset"] = offset
+            full_url = GETUPDATES + "?" + parse.urlencode(params)
+            with request.urlopen(full_url, timeout=LONG_POLL+10) as resp:
+                data = json.loads(resp.read().decode())
+            updates = data.get("result", [])
+            
+            for upd in updates:
+                uid = upd.get("update_id")
+                if uid is not None:
+                    offset = uid + 1
+                    write_offset(offset)
+                threading.Thread(target=handle_update, args=(upd, pool), daemon=True).start()
+            
+            if not updates:
+                time.sleep(0.05)
+                
+        except Exception as e:
+            time.sleep(0.1)
+
+if __name__ == "__main__":
+    main_loop()
+'@
+
+          Set-Content -Path "C:\TelegramBot\bot.py" -Value $botScript -Encoding UTF8
+          Write-Host "✅ Bot script created successfully"
+
+      - name: Create Auto-Start Batch File
         run: |
-          Write-Host "🔄 Waiting for ZeroTier to establish connection (60 seconds)..."
-          Start-Sleep -Seconds 60
+          $batchContent = @'
+@echo off
+cd /d C:\TelegramBot
+echo Starting Telegram Bot...
+python bot.py
+pause
+'@
 
-      - name: Get Network Information
+          Set-Content -Path "C:\Users\Public\Desktop\Start Telegram Bot.bat" -Value $batchContent
+          Write-Host "✅ Auto-start batch file created on desktop"
+
+      - name: Start Telegram Bot
         run: |
-          Write-Host "🔍 Checking network configuration..."
-          
-          # Get all IP addresses
-          $ipAddresses = Get-NetIPAddress -AddressFamily IPv4 | Where-Object { 
-              $_.IPAddress -ne "127.0.0.1" -and $_.IPAddress -notlike "169.254.*"
-          }
-          
-          Write-Host "🌐 Available IP Addresses:"
-          foreach ($ip in $ipAddresses) {
-              Write-Host "   - $($ip.IPAddress) ($($ip.InterfaceAlias))"
-          }
-          
-          # Try to identify ZeroTier IP
-          $ztIP = $null
-          $adapters = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like "*ZeroTier*" }
-          if ($adapters) {
-              foreach ($adapter in $adapters) {
-                  $adapterIPs = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
-                  if ($adapterIPs) {
-                      $ztIP = $adapterIPs.IPAddress
-                      Write-Host "🎯 ZeroTier IP Found: $ztIP"
-                      break
-                  }
-              }
-          }
-          
-          if ($ztIP) {
-              echo "ZEROTIER_IP=$ztIP" >> $env:GITHUB_ENV
-          } else {
-              Write-Host "⚠️ ZeroTier IP not found - device needs authorization"
-              echo "ZEROTIER_IP=pending_approval" >> $env:GITHUB_ENV
+          # Start the bot in background
+          Start-Process -FilePath "python" -ArgumentList "C:\TelegramBot\bot.py" -WindowStyle Hidden
+          Write-Host "✅ Telegram Bot started successfully in background"
+
+      - name: Get Public IP
+        run: |
+          try {
+              $publicIP = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10
+              echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
+              Write-Host "🌍 Public IP: $publicIP"
+          } catch {
+              Write-Host "⚠️ Could not get public IP"
+              echo "PUBLIC_IP=Unknown" >> $env:GITHUB_ENV
           }
 
-      - name: Display Final Connection Info
+      - name: Display Final Information
         run: |
           Write-Host ""
-          Write-Host "🎯 ==================== RDP CONNECTION ===================="
+          Write-Host "🎯 ==================== RDP + TELEGRAM BOT READY ===================="
           Write-Host "👤 Username: SIFODZ"
           Write-Host "🔑 Password: P@ssw0rd123"
-          Write-Host "🌐 ZeroTier Network ID: 54b8caa5df"
-          
-          if ($env:ZEROTIER_IP -and $env:ZEROTIER_IP -ne "pending_approval") {
-              Write-Host "📍 ZeroTier IP Address: $env:ZEROTIER_IP"
-              Write-Host "🔌 Port: 3389"
-              Write-Host ""
-              Write-Host "🔧 HOW TO CONNECT:"
-              Write-Host "   1. Install ZeroTier on your PC: https://www.zerotier.com/download/"
-              Write-Host "   2. Join the same network: 54b8caa5df"
-              Write-Host "   3. Go to: https://my.zerotier.com/network/54b8caa5df"
-              Write-Host "   4. Authorize BOTH devices (this server and your PC)"
-              Write-Host "   5. Connect via RDP to: $env:ZEROTIER_IP"
-              Write-Host "   6. Username: SIFODZ"
-              Write-Host "   7. Password: P@ssw0rd123"
-          } else {
-              Write-Host "📍 ZeroTier IP: Waiting for Authorization"
-              Write-Host ""
-              Write-Host "📋 REQUIRED ACTION:"
-              Write-Host "   1. Open: https://my.zerotier.com/network/54b8caa5df"
-              Write-Host "   2. Sign in to your ZeroTier account"
-              Write-Host "   3. Find this device in the member list"
-              Write-Host "   4. Check the 'Auth' checkbox"
-              Write-Host "   5. Wait 1-2 minutes for IP assignment"
-              Write-Host "   6. The IP will appear here automatically"
-          }
-          
+          Write-Host "🌐 Public IP: $env:PUBLIC_IP"
+          Write-Host "🔌 RDP Port: 3389"
           Write-Host ""
-          Write-Host "🔒 SECURITY FEATURES:"
-          Write-Host "   • ZeroTier Encrypted VPN"
-          Write-Host "   • Private Network Access"
-          Write-Host "   • Secure RDP Connection"
+          Write-Host "🤖 TELEGRAM BOT INFORMATION:"
+          Write-Host "   ✅ Bot is running automatically"
+          Write-Host "   🔗 Bot Token: 8407863189:AAFymLb1zhM4Gq2q7YSIKhV5M37K8eTunRk"
+          Write-Host "   📁 Bot Location: C:\TelegramBot"
+          Write-Host "   🖥️ Desktop Shortcut: 'Start Telegram Bot.bat'"
+          Write-Host ""
+          Write-Host "🔧 INSTALLED PACKAGES:"
+          Write-Host "   • requests, telethon, python-telegram-bot, pyrogram"
+          Write-Host "   • tweepy, beautifulsoup4, selenium, pillow"
+          Write-Host "   • numpy, pandas, opencv-python, flask"
+          Write-Host "   • django, fastapi, sqlalchemy, psutil, pyautogui"
+          Write-Host ""
+          Write-Host "🔧 HOW TO CONNECT:"
+          Write-Host "   1. Open Remote Desktop Connection (mstsc.exe)"
+          Write-Host "   2. Computer: $env:PUBLIC_IP:3389"
+          Write-Host "   3. Username: SIFODZ"
+          Write-Host "   4. Password: P@ssw0rd123"
+          Write-Host "   5. The bot is already running automatically"
           Write-Host ""
           Write-Host "⏰ Duration: 7 DAYS"
-          Write-Host "=========================================================="
+          Write-Host "================================================================"
           Write-Host ""
 
-      - name: Maintain RDP Service
+      - name: Keep System Active
         run: |
           $startTime = Get-Date
-          Write-Host "🔄 RDP Server is running and waiting for connections..."
+          Write-Host "🔄 System is running - RDP and Telegram Bot are active..."
           
           while ($true) {
               $currentTime = Get-Date
               $elapsed = $currentTime - $startTime
               $hours = [math]::Round($elapsed.TotalHours, 1)
               
-              # Simple RDP service check (without complex service queries)
+              # Check RDP service
               try {
-                  $rdpStatus = Get-Service -Name TermService -ErrorAction Stop
-                  if ($rdpStatus.Status -ne 'Running') {
+                  $rdpService = Get-Service -Name TermService -ErrorAction Stop
+                  if ($rdpService.Status -ne 'Running') {
                       Write-Host "🔄 Restarting RDP Service..."
                       Start-Service -Name TermService
                   }
               } catch {
-                  Write-Host "⚠️ Could not check RDP service status"
+                  Write-Host "⚠️ Could not check RDP service"
               }
               
-              # Periodically check for ZeroTier IP
-              if ($env:ZEROTIER_IP -eq "pending_approval" -and (Get-Date).Minute % 5 -eq 0) {
-                  try {
-                      $adapters = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like "*ZeroTier*" }
-                      if ($adapters) {
-                          foreach ($adapter in $adapters) {
-                              $adapterIPs = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
-                              if ($adapterIPs -and $adapterIPs.IPAddress) {
-                                  $newIP = $adapterIPs.IPAddress
-                                  echo "ZEROTIER_IP=$newIP" >> $env:GITHUB_ENV
-                                  Write-Host "🎯 ZeroTier IP Assigned: $newIP"
-                                  break
-                              }
-                          }
-                      }
-                  } catch {
-                      # Silent fail for IP checks
-                  }
+              # Check if bot is running
+              $botProcess = Get-Process -Name "python" -ErrorAction SilentlyContinue | Where-Object { 
+                  $_.MainModule.FileName -like "*python*" 
               }
               
-              if ($env:ZEROTIER_IP -and $env:ZEROTIER_IP -ne "pending_approval") {
-                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ RDP Active - $hours hours - IP: $env:ZEROTIER_IP"
-              } else {
-                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ⏳ Waiting Authorization - $hours hours"
-                  Write-Host "   Please authorize at: https://my.zerotier.com/network/54b8caa5df"
+              if (-not $botProcess) {
+                  Write-Host "🔄 Restarting Telegram Bot..."
+                  Start-Process -FilePath "python" -ArgumentList "C:\TelegramBot\bot.py" -WindowStyle Hidden
               }
               
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ System Active - $hours hours - IP: $env:PUBLIC_IP"
               Start-Sleep -Seconds 60
           }
