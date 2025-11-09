@@ -12,6 +12,7 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
           netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+          netsh advfirewall firewall add rule name="RDP-DuckDNS" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
           Write-Host "✅ RDP configured successfully"
 
@@ -28,102 +29,133 @@ jobs:
           echo "RDP_USER=SIFODZ" >> $env:GITHUB_ENV
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
-      - name: Download and Setup Ngrok with Auth
+      - name: Get Public IP and Update DuckDNS
         run: |
-          # Download Ngrok
-          $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
-          $ngrokZip = "$env:TEMP\ngrok.zip"
-          $ngrokDir = "C:\ngrok"
+          # Get current public IP
+          $publicIP = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10
+          echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
+          Write-Host "🌍 Public IP: $publicIP"
           
-          Invoke-WebRequest -Uri $ngrokUrl -OutFile $ngrokZip
-          New-Item -ItemType Directory -Path $ngrokDir -Force
-          Expand-Archive -Path $ngrokZip -DestinationPath $ngrokDir -Force
-          Remove-Item $ngrokZip -Force
+          # Update DuckDNS with your domain and token
+          $duckdnsToken = "6057ecf3-d13f-4440-9544-466fee7eb60b"
+          $duckdnsDomain = "sifogmlj"
           
-          # Setup Ngrok with authentication token (free account)
-          & "C:\ngrok\ngrok.exe" config add-authtoken 2j9Wk9nRVL74snB7LZv8r_5q3pZ9B5pXZgqRzC8Lq1Mb
-          Write-Host "✅ Ngrok installed with authentication"
-
-      - name: Start Ngrok and Get Public URL
-        run: |
-          # Start Ngrok in background and capture output
-          $ngrokProcess = Start-Process -FilePath "C:\ngrok\ngrok.exe" -ArgumentList "tcp 3389 --log stdout" -RedirectStandardOutput "$env:TEMP\ngrok.log" -PassThru -WindowStyle Hidden
-          echo "NGROK_PID=$($ngrokProcess.Id)" >> $env:GITHUB_ENV
+          $updateUrl = "https://www.duckdns.org/update?domains=$duckdnsDomain&token=$duckdnsToken&ip=$publicIP"
+          $result = Invoke-RestMethod -Uri $updateUrl
           
-          # Wait for tunnel to establish
-          Write-Host "🔄 Waiting for Ngrok tunnel to start..."
-          Start-Sleep -Seconds 15
-          
-          # Get the public URL from log file
-          $ngrokLog = Get-Content "$env:TEMP\ngrok.log" -Tail 20
-          Write-Host "Ngrok Log:"
-          Write-Host $ngrokLog
-          
-          # Extract URL from log
-          $publicUrl = $ngrokLog | Select-String -Pattern "url=tcp://(.+)" | ForEach-Object { $_.Matches.Groups[1].Value }
-          
-          if ($publicUrl) {
-              echo "NGROK_URL=$publicUrl" >> $env:GITHUB_ENV
-              Write-Host "✅ Ngrok Public URL: tcp://$publicUrl"
+          if ($result -eq "OK") {
+              echo "DUCKDNS_URL=$duckdnsDomain.duckdns.org" >> $env:GITHUB_ENV
+              Write-Host "✅ DuckDNS updated successfully: $duckdnsDomain.duckdns.org -> $publicIP"
           } else {
-              # Alternative method - use ngrok API
-              try {
-                  $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 5
-                  $publicUrl = $tunnels.tunnels[0].public_url -replace 'tcp://', ''
-                  echo "NGROK_URL=$publicUrl" >> $env:GITHUB_ENV
-                  Write-Host "✅ Ngrok Public URL: $publicUrl"
-              } catch {
-                  Write-Host "❌ Could not get Ngrok URL automatically"
-                  Write-Host "📋 Please visit: https://dashboard.ngrok.com/status/tunnels"
-                  echo "NGROK_URL=manual_check_required" >> $env:GITHUB_ENV
-              }
+              Write-Host "❌ DuckDNS update failed: $result"
+              exit 1
           }
 
-      - name: Display Final Connection Info
+      - name: Install and Configure Cloudflared Tunnel
+        run: |
+          # Download Cloudflared
+          $cloudflaredUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          $cloudflaredDir = "C:\cloudflared"
+          $cloudflaredPath = "$cloudflaredDir\cloudflared.exe"
+          
+          New-Item -ItemType Directory -Path $cloudflaredDir -Force
+          Invoke-WebRequest -Uri $cloudflaredUrl -OutFile $cloudflaredPath
+          Write-Host "✅ Cloudflared installed"
+
+      - name: Start Cloudflared Tunnel
+        run: |
+          # Start Cloudflared tunnel in background
+          $tunnelProcess = Start-Process -FilePath "C:\cloudflared\cloudflared.exe" -ArgumentList "tunnel --url rdp://localhost:3389" -PassThru -WindowStyle Hidden
+          echo "TUNNEL_PID=$($tunnelProcess.Id)" >> $env:GITHUB_ENV
+          Write-Host "✅ Cloudflared tunnel started (PID: $($tunnelProcess.Id))"
+          
+          # Wait for tunnel to establish
+          Write-Host "🔄 Waiting for tunnel to initialize..."
+          Start-Sleep -Seconds 15
+          
+          # Try to get tunnel URL
+          try {
+              $tunnelInfo = & "C:\cloudflared\cloudflared.exe" tunnel list --format json | ConvertFrom-Json
+              if ($tunnelInfo.Count -gt 0) {
+                  $tunnelUrl = $tunnelInfo[0].hostname
+                  echo "TUNNEL_URL=$tunnelUrl" >> $env:GITHUB_ENV
+                  Write-Host "🌐 Cloudflared Tunnel URL: $tunnelUrl"
+              }
+          } catch {
+              Write-Host "⚠️ Could not get Cloudflared URL, using DuckDNS only"
+          }
+
+      - name: Display Connection Information
         run: |
           Write-Host ""
-          Write-Host "🎯 ==================== RDP CONNECTION INFO ===================="
+          Write-Host "🎯 ==================== RDP CONNECTION READY ===================="
           Write-Host "👤 Username: $env:RDP_USER"
           Write-Host "🔑 Password: $env:RDP_PASSWORD"
-          Write-Host "🌐 Ngrok Address: $env:NGROK_URL"
           Write-Host ""
-          Write-Host "🔧 HOW TO CONNECT:"
+          Write-Host "🌐 CONNECTION METHODS:"
+          Write-Host ""
+          Write-Host "📍 METHOD 1 - DuckDNS (Recommended):"
+          Write-Host "   Computer: $env:DUCKDNS_URL:3389"
+          Write-Host "   Username: $env:RDP_USER"
+          Write-Host "   Password: $env:RDP_PASSWORD"
+          Write-Host ""
+          if ($env:TUNNEL_URL) {
+              Write-Host "📍 METHOD 2 - Cloudflared Tunnel:"
+              Write-Host "   Computer: $env:TUNNEL_URL"
+              Write-Host "   Username: $env:RDP_USER"
+              Write-Host "   Password: $env:RDP_PASSWORD"
+              Write-Host ""
+          }
+          Write-Host "🔧 INSTRUCTIONS:"
           Write-Host "   1. Open Remote Desktop Connection (mstsc.exe)"
-          Write-Host "   2. Computer: $env:NGROK_URL"
-          Write-Host "   3. Username: $env:RDP_USER"
-          Write-Host "   4. Password: $env:RDP_PASSWORD"
-          Write-Host ""
-          Write-Host "📋 ALTERNATIVE METHOD:"
-          Write-Host "   Visit: https://dashboard.ngrok.com/status/tunnels"
-          Write-Host "   Look for the tunnel and copy the address"
+          Write-Host "   2. Enter the Computer address from above"
+          Write-Host "   3. Use Username and Password shown"
+          Write-Host "   4. Click Connect and enjoy!"
           Write-Host ""
           Write-Host "⏰ Duration: 7 DAYS"
-          Write-Host "=============================================================="
+          Write-Host "================================================================"
           Write-Host ""
 
-      - name: Maintain Active Connection
+      - name: Maintain Services and Update DuckDNS
         run: |
-          Write-Host "🔄 RDP Server is active and waiting for connections..."
-          Write-Host "📡 Monitoring Ngrok tunnel..."
+          $startTime = Get-Date
+          Write-Host "🔄 All services are running and monitoring..."
           
-          $checkCount = 0
           while ($true) {
-              $checkCount++
+              $currentTime = Get-Date
+              $elapsed = $currentTime - $startTime
+              $hours = [math]::Round($elapsed.TotalHours, 1)
               
-              # Check Ngrok status every 10 checks
-              if ($checkCount % 10 -eq 0) {
+              # Check RDP service
+              $rdpService = Get-Service -Name TermService
+              if ($rdpService.Status -ne 'Running') {
+                  Write-Host "🔄 Restarting RDP Service..."
+                  Start-Service -Name TermService
+              }
+              
+              # Check Cloudflared tunnel
+              $tunnelProcess = Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue
+              if (-not $tunnelProcess) {
+                  Write-Host "🔄 Restarting Cloudflared Tunnel..."
+                  Start-Process -FilePath "C:\cloudflared\cloudflared.exe" -ArgumentList "tunnel --url rdp://localhost:3389" -WindowStyle Hidden
+              }
+              
+              # Update DuckDNS every 30 minutes to keep it fresh
+              if ((Get-Date).Minute % 30 -eq 0) {
                   try {
-                      $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 3
-                      $currentUrl = $tunnels.tunnels[0].public_url -replace 'tcp://', ''
-                      Write-Host "🔗 Active Tunnel: $currentUrl"
+                      $publicIP = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10
+                      $duckdnsToken = "6057ecf3-d13f-4440-9544-466fee7eb60b"
+                      $duckdnsDomain = "sifogmlj"
+                      $updateUrl = "https://www.duckdns.org/update?domains=$duckdnsDomain&token=$duckdnsToken&ip=$publicIP"
+                      $result = Invoke-RestMethod -Uri $updateUrl
+                      if ($result -eq "OK") {
+                          Write-Host "🔄 DuckDNS updated: $duckdnsDomain.duckdns.org -> $publicIP"
+                      }
                   } catch {
-                      Write-Host "⚠️ Cannot get tunnel status - but RDP is running"
+                      Write-Host "⚠️ DuckDNS update failed, will retry later"
                   }
               }
               
-              # Display connection info every 5 minutes
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP Ready - Connect to: $env:NGROK_URL"
-              Write-Host "   Username: $env:RDP_USER | Password: $env:RDP_PASSWORD"
-              
-              Start-Sleep -Seconds 30
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ RDP Active - $hours hours - Connect to: $env:DUCKDNS_URL:3389"
+              Start-Sleep -Seconds 60
           }
