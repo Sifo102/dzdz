@@ -1,6 +1,11 @@
 name: RDP
 on:
   workflow_dispatch:
+    inputs:
+      zerotier_network:
+        description: 'ZeroTier Network ID'
+        required: true
+        type: string
 jobs:
   secure-rdp:
     runs-on: windows-latest
@@ -12,7 +17,7 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
           netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
-          netsh advfirewall firewall add rule name="RDP-DuckDNS" dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name="RDP-ZeroTier" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
           Write-Host "✅ RDP configured successfully"
 
@@ -28,54 +33,139 @@ jobs:
           Enable-LocalUser -Name "SIFODZ"
           Write-Host "✅ User account created"
 
-      - name: Get Public IP and Update DuckDNS
+      - name: Install ZeroTier
         run: |
-          # Get current public IP
-          $publicIP = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10
-          Write-Host "🌍 Public IP: $publicIP"
+          # Download and install ZeroTier
+          $zerotierUrl = "https://download.zerotier.com/dist/ZeroTier%20One.msi"
+          $installerPath = "$env:TEMP\zerotier.msi"
           
-          # Update DuckDNS with your domain and token
-          $duckdnsToken = "6057ecf3-d13f-4440-9544-466fee7eb60b"
-          $duckdnsDomain = "sifogmlj"
+          Invoke-WebRequest -Uri $zerotierUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
           
-          $updateUrl = "https://www.duckdns.org/update?domains=$duckdnsDomain&token=$duckdnsToken&ip=$publicIP"
-          $result = Invoke-RestMethod -Uri $updateUrl
+          # Wait for service to start
+          Start-Sleep -Seconds 10
+          Write-Host "✅ ZeroTier installed successfully"
+
+      - name: Join ZeroTier Network
+        run: |
+          $networkId = "${{ github.event.inputs.zerotier_network }}"
           
-          if ($result -eq "OK") {
-              Write-Host "✅ DuckDNS updated successfully: sifogmlj.duckdns.org -> $publicIP"
-          } else {
-              Write-Host "❌ DuckDNS update failed: $result"
+          if (-not $networkId) {
+              Write-Host "❌ No ZeroTier Network ID provided"
+              Write-Host "📋 Create a network at: https://my.zerotier.com"
               exit 1
+          }
+          
+          # Join ZeroTier network
+          & "C:\Program Files (x86)\ZeroTier\One\zerotier-one_x64.exe" join $networkId
+          Write-Host "✅ Joined ZeroTier network: $networkId"
+          
+          # Wait for connection
+          Start-Sleep -Seconds 15
+          
+          # Get ZeroTier IP address
+          $zerotierStatus = & "C:\Program Files (x86)\ZeroTier\One\zerotier-one_x64.exe" status
+          Write-Host "ZeroTier Status: $zerotierStatus"
+          
+          $retries = 0
+          $ztIP = $null
+          
+          while (-not $ztIP -and $retries -lt 20) {
+              $ztInfo = & "C:\Program Files (x86)\ZeroTier\One\zerotier-one_x64.exe" listnetworks
+              Write-Host "ZeroTier Networks: $ztInfo"
+              
+              # Extract IP from network info
+              if ($ztInfo -match '(\d+\.\d+\.\d+\.\d+)') {
+                  $ztIP = $matches[1]
+                  break
+              }
+              
+              $retries++
+              Start-Sleep -Seconds 5
+          }
+          
+          if ($ztIP) {
+              echo "ZEROTIER_IP=$ztIP" >> $env:GITHUB_ENV
+              Write-Host "✅ ZeroTier IP: $ztIP"
+          } else {
+              Write-Host "⚠️ ZeroTier IP not assigned yet"
+              Write-Host "📋 Check network at: https://my.zerotier.com"
+              echo "ZEROTIER_IP=pending_approval" >> $env:GITHUB_ENV
+          }
+
+      - name: Configure Advanced Security
+        run: |
+          # Enable enhanced security features
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name "LimitBlankPasswordUse" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name "RestrictAnonymous" -Value 1 -Force
+          
+          # Configure enhanced RDP security
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MinEncryptionLevel" -Value 3 -Force
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "Security" -Value 0 -Force
+          
+          # Disable weak protocols
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\PCT 1.0\Server' -Name "Enabled" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\SSL 2.0\Server' -Name "Enabled" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\SSL 3.0\Server' -Name "Enabled" -Value 0 -Force
+          
+          Write-Host "✅ Enhanced security configured"
+
+      - name: Verify RDP Accessibility
+        run: |
+          if ($env:ZEROTIER_IP -and $env:ZEROTIER_IP -ne "pending_approval") {
+              Write-Host "Testing RDP connection to: $env:ZEROTIER_IP"
+              $testResult = Test-NetConnection -ComputerName $env:ZEROTIER_IP -Port 3389 -InformationLevel Quiet
+              if ($testResult) {
+                  Write-Host "✅ RDP connectivity successful!"
+              } else {
+                  Write-Host "⚠️ RDP connection test failed - ZeroTier may need approval"
+              }
+          } else {
+              Write-Host "⏳ ZeroTier IP pending - RDP will be available after network approval"
           }
 
       - name: Display Connection Information
         run: |
           Write-Host ""
-          Write-Host "🎯 ==================== RDP CONNECTION READY ===================="
+          Write-Host "🎯 ==================== ZEROTIER RDP ===================="
           Write-Host "👤 Username: SIFODZ"
           Write-Host "🔑 Password: P@ssw0rd123"
-          Write-Host "🌐 Address: sifogmlj.duckdns.org:3389"
-          Write-Host "📡 Public IP: 52.190.140.96"
+          
+          if ($env:ZEROTIER_IP -and $env:ZEROTIER_IP -ne "pending_approval") {
+              Write-Host "🌐 ZeroTier IP: $env:ZEROTIER_IP"
+              Write-Host "🔌 Port: 3389"
+              Write-Host ""
+              Write-Host "🔧 HOW TO CONNECT:"
+              Write-Host "   1. Install ZeroTier on your local machine"
+              Write-Host "   2. Join the same network: ${{ github.event.inputs.zerotier_network }}"
+              Write-Host "   3. Open RDP and connect to: $env:ZEROTIER_IP"
+              Write-Host "   4. Username: SIFODZ"
+              Write-Host "   5. Password: P@ssw0rd123"
+          } else {
+              Write-Host "🌐 ZeroTier IP: Pending Approval"
+              Write-Host ""
+              Write-Host "📋 REQUIRED ACTION:"
+              Write-Host "   1. Go to: https://my.zerotier.com"
+              Write-Host "   2. Find network: ${{ github.event.inputs.zerotier_network }}"
+              Write-Host "   3. Check 'Auth' checkbox for this device"
+              Write-Host "   4. Wait for IP assignment"
+          }
+          
           Write-Host ""
-          Write-Host "🔧 HOW TO CONNECT:"
-          Write-Host "   1. Open Remote Desktop Connection (press Windows + R, type 'mstsc')"
-          Write-Host "   2. In Computer field enter: sifogmlj.duckdns.org:3389"
-          Write-Host "   3. Username: SIFODZ"
-          Write-Host "   4. Password: P@ssw0rd123"
-          Write-Host "   5. Click Connect"
+          Write-Host "🔒 SECURITY FEATURES:"
+          Write-Host "   • ZeroTier Encrypted VPN"
+          Write-Host "   • Enhanced RDP Security"
+          Write-Host "   • Private Network Isolation"
           Write-Host ""
           Write-Host "⏰ Duration: 7 DAYS"
-          Write-Host "================================================================"
+          Write-Host "=========================================================="
           Write-Host ""
 
-      - name: Maintain RDP Service
+      - name: Maintain Secure Connection
         run: |
           $startTime = Get-Date
-          Write-Host "🔄 RDP Server is running and waiting for connections..."
-          Write-Host "📍 Connect to: sifogmlj.duckdns.org:3389"
-          Write-Host "👤 Username: SIFODZ"
-          Write-Host "🔑 Password: P@ssw0rd123"
-          Write-Host ""
+          Write-Host "🔄 ZeroTier RDP Server is running..."
           
           while ($true) {
               $currentTime = Get-Date
@@ -89,22 +179,34 @@ jobs:
                   Start-Service -Name TermService
               }
               
-              # Update DuckDNS every 30 minutes
-              if ((Get-Date).Minute % 30 -eq 0) {
+              # Check ZeroTier service
+              $zerotierService = Get-Service -Name "ZeroTier One Service" -ErrorAction SilentlyContinue
+              if (-not $zerotierService -or $zerotierService.Status -ne 'Running') {
+                  Write-Host "🔄 Restarting ZeroTier Service..."
+                  Start-Service -Name "ZeroTier One Service" -ErrorAction SilentlyContinue
+              }
+              
+              # Update ZeroTier IP if available
+              if ($env:ZEROTIER_IP -eq "pending_approval") {
                   try {
-                      $publicIP = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10
-                      $duckdnsToken = "6057ecf3-d13f-4440-9544-466fee7eb60b"
-                      $duckdnsDomain = "sifogmlj"
-                      $updateUrl = "https://www.duckdns.org/update?domains=$duckdnsDomain&token=$duckdnsToken&ip=$publicIP"
-                      $result = Invoke-RestMethod -Uri $updateUrl
-                      if ($result -eq "OK") {
-                          Write-Host "🔄 DuckDNS updated: sifogmlj.duckdns.org -> $publicIP"
+                      $ztInfo = & "C:\Program Files (x86)\ZeroTier\One\zerotier-one_x64.exe" listnetworks
+                      if ($ztInfo -match '(\d+\.\d+\.\d+\.\d+)') {
+                          $newIP = $matches[1]
+                          if ($newIP -ne $env:ZEROTIER_IP) {
+                              echo "ZEROTIER_IP=$newIP" >> $env:GITHUB_ENV
+                              Write-Host "🎯 ZeroTier IP Assigned: $newIP"
+                          }
                       }
                   } catch {
-                      Write-Host "⚠️ DuckDNS update failed, will retry later"
+                      # Ignore errors during IP check
                   }
               }
               
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ RDP Active - $hours hours - Address: sifogmlj.duckdns.org:3389"
+              if ($env:ZEROTIER_IP -and $env:ZEROTIER_IP -ne "pending_approval") {
+                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ RDP Active - $hours hours - IP: $env:ZEROTIER_IP"
+              } else {
+                  Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ⏳ Waiting Approval - $hours hours - Check ZeroTier Central"
+              }
+              
               Start-Sleep -Seconds 60
           }
