@@ -26,100 +26,60 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "SIFODZ"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "SIFODZ"
           Enable-LocalUser -Name "SIFODZ"
-          echo "RDP_USER=SIFODZ" >> $env:GITHUB_ENV
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "✅ User account created"
 
       - name: Get Public IP and Update DuckDNS
         run: |
           # Get current public IP
           $publicIP = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10
-          echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
           Write-Host "🌍 Public IP: $publicIP"
           
           # Update DuckDNS with your domain and token
           $duckdnsToken = "6057ecf3-d13f-4440-9544-466fee7eb60b"
           $duckdnsDomain = "sifogmlj"
+          $duckdnsUrl = "$duckdnsDomain.duckdns.org"
           
           $updateUrl = "https://www.duckdns.org/update?domains=$duckdnsDomain&token=$duckdnsToken&ip=$publicIP"
           $result = Invoke-RestMethod -Uri $updateUrl
           
           if ($result -eq "OK") {
-              echo "DUCKDNS_URL=$duckdnsDomain.duckdns.org" >> $env:GITHUB_ENV
-              Write-Host "✅ DuckDNS updated successfully: $duckdnsDomain.duckdns.org -> $publicIP"
+              Write-Host "✅ DuckDNS updated successfully: $duckdnsUrl -> $publicIP"
+              # Save to file instead of environment variable
+              Set-Content -Path "$env:GITHUB_WORKSPACE\connection.txt" -Value "RDP Connection Information:`n`nAddress: $duckdnsUrl:3389`nUsername: SIFODZ`nPassword: P@ssw0rd123`nPublic IP: $publicIP"
           } else {
               Write-Host "❌ DuckDNS update failed: $result"
               exit 1
           }
 
-      - name: Install and Configure Cloudflared Tunnel
-        run: |
-          # Download Cloudflared
-          $cloudflaredUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          $cloudflaredDir = "C:\cloudflared"
-          $cloudflaredPath = "$cloudflaredDir\cloudflared.exe"
-          
-          New-Item -ItemType Directory -Path $cloudflaredDir -Force
-          Invoke-WebRequest -Uri $cloudflaredUrl -OutFile $cloudflaredPath
-          Write-Host "✅ Cloudflared installed"
-
-      - name: Start Cloudflared Tunnel
-        run: |
-          # Start Cloudflared tunnel in background
-          $tunnelProcess = Start-Process -FilePath "C:\cloudflared\cloudflared.exe" -ArgumentList "tunnel --url rdp://localhost:3389" -PassThru -WindowStyle Hidden
-          echo "TUNNEL_PID=$($tunnelProcess.Id)" >> $env:GITHUB_ENV
-          Write-Host "✅ Cloudflared tunnel started (PID: $($tunnelProcess.Id))"
-          
-          # Wait for tunnel to establish
-          Write-Host "🔄 Waiting for tunnel to initialize..."
-          Start-Sleep -Seconds 15
-          
-          # Try to get tunnel URL
-          try {
-              $tunnelInfo = & "C:\cloudflared\cloudflared.exe" tunnel list --format json | ConvertFrom-Json
-              if ($tunnelInfo.Count -gt 0) {
-                  $tunnelUrl = $tunnelInfo[0].hostname
-                  echo "TUNNEL_URL=$tunnelUrl" >> $env:GITHUB_ENV
-                  Write-Host "🌐 Cloudflared Tunnel URL: $tunnelUrl"
-              }
-          } catch {
-              Write-Host "⚠️ Could not get Cloudflared URL, using DuckDNS only"
-          }
-
       - name: Display Connection Information
         run: |
+          $duckdnsUrl = "sifogmlj.duckdns.org"
           Write-Host ""
           Write-Host "🎯 ==================== RDP CONNECTION READY ===================="
-          Write-Host "👤 Username: $env:RDP_USER"
-          Write-Host "🔑 Password: $env:RDP_PASSWORD"
+          Write-Host "👤 Username: SIFODZ"
+          Write-Host "🔑 Password: P@ssw0rd123"
+          Write-Host "🌐 Address: $duckdnsUrl:3389"
+          Write-Host "📡 Public IP: 52.154.130.209"
           Write-Host ""
-          Write-Host "🌐 CONNECTION METHODS:"
-          Write-Host ""
-          Write-Host "📍 METHOD 1 - DuckDNS (Recommended):"
-          Write-Host "   Computer: $env:DUCKDNS_URL:3389"
-          Write-Host "   Username: $env:RDP_USER"
-          Write-Host "   Password: $env:RDP_PASSWORD"
-          Write-Host ""
-          if ($env:TUNNEL_URL) {
-              Write-Host "📍 METHOD 2 - Cloudflared Tunnel:"
-              Write-Host "   Computer: $env:TUNNEL_URL"
-              Write-Host "   Username: $env:RDP_USER"
-              Write-Host "   Password: $env:RDP_PASSWORD"
-              Write-Host ""
-          }
-          Write-Host "🔧 INSTRUCTIONS:"
-          Write-Host "   1. Open Remote Desktop Connection (mstsc.exe)"
-          Write-Host "   2. Enter the Computer address from above"
-          Write-Host "   3. Use Username and Password shown"
-          Write-Host "   4. Click Connect and enjoy!"
+          Write-Host "🔧 HOW TO CONNECT:"
+          Write-Host "   1. Open Remote Desktop Connection (press Windows + R, type 'mstsc')"
+          Write-Host "   2. In Computer field enter: $duckdnsUrl:3389"
+          Write-Host "   3. Username: SIFODZ"
+          Write-Host "   4. Password: P@ssw0rd123"
+          Write-Host "   5. Click Connect"
           Write-Host ""
           Write-Host "⏰ Duration: 7 DAYS"
           Write-Host "================================================================"
           Write-Host ""
 
-      - name: Maintain Services and Update DuckDNS
+      - name: Maintain RDP Service
         run: |
+          $duckdnsUrl = "sifogmlj.duckdns.org"
           $startTime = Get-Date
-          Write-Host "🔄 All services are running and monitoring..."
+          Write-Host "🔄 RDP Server is running and waiting for connections..."
+          Write-Host "📍 Connect to: $duckdnsUrl:3389"
+          Write-Host "👤 Username: SIFODZ"
+          Write-Host "🔑 Password: P@ssw0rd123"
           
           while ($true) {
               $currentTime = Get-Date
@@ -133,14 +93,7 @@ jobs:
                   Start-Service -Name TermService
               }
               
-              # Check Cloudflared tunnel
-              $tunnelProcess = Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue
-              if (-not $tunnelProcess) {
-                  Write-Host "🔄 Restarting Cloudflared Tunnel..."
-                  Start-Process -FilePath "C:\cloudflared\cloudflared.exe" -ArgumentList "tunnel --url rdp://localhost:3389" -WindowStyle Hidden
-              }
-              
-              # Update DuckDNS every 30 minutes to keep it fresh
+              # Update DuckDNS every 30 minutes
               if ((Get-Date).Minute % 30 -eq 0) {
                   try {
                       $publicIP = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10
@@ -156,6 +109,6 @@ jobs:
                   }
               }
               
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ RDP Active - $hours hours - Connect to: $env:DUCKDNS_URL:3389"
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ RDP Active - $hours hours - Address: $duckdnsUrl:3389"
               Start-Sleep -Seconds 60
           }
