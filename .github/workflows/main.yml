@@ -1,36 +1,53 @@
-name: VPS Free Ubuntu by SIFO
+name: VPS
 
-on: 
+on:
   workflow_dispatch:
 
 jobs:
-  build:
+  create-vps:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
+
     steps:
-    - name: Start VPS on Ubuntu ☁️
-      run: |
-        echo "✅ VPS Ubuntu started successfully!"
-        sudo apt update -y
-        sudo apt install -y openssh-server curl
-        sudo systemctl enable ssh
-        sudo systemctl start ssh
-        echo "root:123456" | sudo chpasswd
-        echo "💻 Username: root"
-        echo "🔑 Password: 123456"
-        echo "🌍 Connecting to Serveo..."
-        ssh -o StrictHostKeyChecking=no -R 2222:localhost:22 serveo.net &
-        echo "🌐 Waiting for Serveo connection..."
-        sleep 8
-        echo ""
-        echo "✅ VPS is ready!"
-        echo "---------------------------------------"
-        echo "Use this command in Termux or Linux:"
-        echo ""
-        echo "ssh root@serveo.net -p 2222"
-        echo "Password: 123456"
-        echo "---------------------------------------"
-        echo "🕐 VPS will stay online for ~60 minutes"
-        echo ""
-        sleep 3540
-        echo "⏰ VPS session ended. Bye!"
+      - name: ✅ Start Ubuntu VPS
+        run: |
+          echo "🚀 Starting Ubuntu VPS..."
+
+      - name: 🔧 Prepare System
+        run: |
+          sudo apt update -y
+          sudo apt install -y openssh-server wget curl unzip
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+          echo 'root:123456' | sudo chpasswd
+          echo "✅ SSH is ready on port 22"
+
+      - name: 🌐 Install Cloudflare Tunnel
+        run: |
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb
+          echo "✅ Cloudflare Tunnel Installed"
+
+      - name: 🌍 Create Public Tunnel
+        run: |
+          echo "🔄 Launching Cloudflare tunnel..."
+          nohup cloudflared tunnel --url ssh://localhost:22 > tunnel.log 2>&1 &
+          sleep 8
+          echo "✅ Tunnel started successfully!"
+          echo "-------------------------------------"
+          echo "💻 VPS LOGIN INFO"
+          echo "Username: root"
+          echo "Password: 123456"
+          echo "-------------------------------------"
+          echo "📡 Tunnel URL (use below command to connect):"
+          cat tunnel.log | grep -o "https://[-0-9a-z]*\.trycloudflare\.com" | head -n 1
+          echo "-------------------------------------"
+          echo "🕐 VPS active for 60 minutes"
+          echo "Keep this workflow running to stay connected!"
+
+      - name: 💤 Keep VPS Running
+        run: |
+          while true; do
+            echo "[$(date)] VPS is running..."
+            sleep 300
+          done
