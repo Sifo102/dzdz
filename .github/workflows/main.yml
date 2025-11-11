@@ -1,45 +1,71 @@
-name: VPS with ngrok TCP
-
+name: Create VPS with Tailscale
 on:
   workflow_dispatch:
 
 jobs:
   create-vps:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
     steps:
-      - name: 🚀 Prepare VPS
-        run: |
-          echo "🚀 Starting Ubuntu VPS..."
-          sudo apt update -y
-          sudo apt install -y openssh-server wget curl unzip
-          sudo systemctl enable ssh
-          sudo systemctl start ssh
-          echo 'root:123456' | sudo chpasswd
-          echo "✅ SSH is ready on port 22"
+      - name: Checkout
+        uses: actions/checkout@v3
 
-      - name: 🌐 Install ngrok
-        run: |
-          wget https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-linux-amd64.zip
-          unzip ngrok-stable-linux-amd64.zip
-          chmod +x ngrok
-          sudo mv ngrok /usr/local/bin/
-          echo "✅ ngrok installed"
+      # --- 1️⃣ إعداد AWS CLI ---
+      - name: Configure AWS CLI
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
 
-      - name: 🔌 Start ngrok TCP Tunnel
+      # --- 2️⃣ إنشاء VPS على EC2 ---
+      - name: Launch EC2 Instance
+        id: ec2
         run: |
-          ./ngrok tcp 22 --region=us > ngrok.log &
-          sleep 8
-          NGROK_URL=$(grep -o "tcp://[0-9a-z]*\.tcp\.ngrok.io:[0-9]*" ngrok.log | head -n 1)
-          echo "✅ Tunnel started!"
-          echo "-------------------------------------"
-          echo "💻 VPS LOGIN INFO"
-          echo "Username: root"
-          echo "Password: 123456"
-          echo "-------------------------------------"
-          echo "📡 Connect via SSH:"
-          echo "ssh root@${NGROK_URL#tcp://}"
-          echo "-------------------------------------"
-          echo "🕐 VPS active for 60 minutes"
-          sleep 3600
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id ami-0c02fb55956c7d316 \
+            --instance-type t2.medium \
+            --key-name MyKeyPair \
+            --security-group-ids sg-xxxxxxxx \
+            --subnet-id subnet-xxxxxxxx \
+            --associate-public-ip-address \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+
+      # --- 3️⃣ الانتظار حتى يصبح VPS جاهز ---
+      - name: Wait for EC2 to be running
+        run: |
+          aws ec2 wait instance-running --instance-ids ${{ env.INSTANCE_ID }}
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids ${{ env.INSTANCE_ID }} \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "VPS Public IP: $PUBLIC_IP"
+
+      # --- 4️⃣ إعداد Tailscale + RDP على VPS عبر PowerShell Remoting ---
+      - name: Setup VPS via PowerShell
+        run: |
+          pwsh -Command "
+          $ip = '${{ env.PUBLIC_IP }}';
+          $user = 'TOOLBOXLAP';
+          $password = 'admin@123';
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force;
+          Invoke-Command -ComputerName $ip -ScriptBlock {
+              # إنشاء المستخدم
+              if (-not (Get-LocalUser -Name $using:user)) { New-LocalUser -Name $using:user -Password $using:securePass -AccountNeverExpires }
+              Add-LocalGroupMember -Group 'Administrators' -Member $using:user
+              Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $using:user
+
+              # تفعيل RDP
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+              Restart-Service -Name TermService -Force
+
+              # تثبيت Tailscale
+              $tsUrl='https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi';
+              $installerPath='$env:TEMP\tailscale.msi';
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath;
+              Start-Process msiexec.exe -ArgumentList '/i', "`"$installerPath`"", '/quiet', '/norestart' -Wait;
+              Remove-Item $installerPath -Force;
+              & '$env:ProgramFiles\Tailscale\tailscale.exe' up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname='vps-github';
+          }"
