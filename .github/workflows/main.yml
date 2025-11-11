@@ -1,4 +1,4 @@
-name: VPS
+name: VPS with ngrok TCP
 
 on:
   workflow_dispatch:
@@ -6,15 +6,12 @@ on:
 jobs:
   create-vps:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 60
 
     steps:
-      - name: ✅ Start Ubuntu VPS
+      - name: 🚀 Prepare VPS
         run: |
           echo "🚀 Starting Ubuntu VPS..."
-
-      - name: 🔧 Prepare System
-        run: |
           sudo apt update -y
           sudo apt install -y openssh-server wget curl unzip
           sudo systemctl enable ssh
@@ -22,32 +19,27 @@ jobs:
           echo 'root:123456' | sudo chpasswd
           echo "✅ SSH is ready on port 22"
 
-      - name: 🌐 Install Cloudflare Tunnel
+      - name: 🌐 Install ngrok
         run: |
-          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared-linux-amd64.deb
-          echo "✅ Cloudflare Tunnel Installed"
+          wget https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-linux-amd64.zip
+          unzip ngrok-stable-linux-amd64.zip
+          chmod +x ngrok
+          sudo mv ngrok /usr/local/bin/
+          echo "✅ ngrok installed"
 
-      - name: 🌍 Create Public Tunnel
+      - name: 🔌 Start ngrok TCP Tunnel
         run: |
-          echo "🔄 Launching Cloudflare tunnel..."
-          nohup cloudflared tunnel --url ssh://localhost:22 > tunnel.log 2>&1 &
+          ./ngrok tcp 22 --region=us > ngrok.log &
           sleep 8
-          echo "✅ Tunnel started successfully!"
+          NGROK_URL=$(grep -o "tcp://[0-9a-z]*\.tcp\.ngrok.io:[0-9]*" ngrok.log | head -n 1)
+          echo "✅ Tunnel started!"
           echo "-------------------------------------"
           echo "💻 VPS LOGIN INFO"
           echo "Username: root"
           echo "Password: 123456"
           echo "-------------------------------------"
-          echo "📡 Tunnel URL (use below command to connect):"
-          cat tunnel.log | grep -o "https://[-0-9a-z]*\.trycloudflare\.com" | head -n 1
+          echo "📡 Connect via SSH:"
+          echo "ssh root@${NGROK_URL#tcp://}"
           echo "-------------------------------------"
           echo "🕐 VPS active for 60 minutes"
-          echo "Keep this workflow running to stay connected!"
-
-      - name: 💤 Keep VPS Running
-        run: |
-          while true; do
-            echo "[$(date)] VPS is running..."
-            sleep 300
-          done
+          sleep 3600
