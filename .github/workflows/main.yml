@@ -1,18 +1,18 @@
-name: Create-VPS
+name: VPS
 
 on:
   workflow_dispatch:
 
 jobs:
-  create-vps:
+  vps:
     runs-on: ubuntu-latest
     timeout-minutes: 3600
 
     env:
-      DROPLET_NAME: gh-vps-${{ github.run_id }}
+      DROPLET_NAME: vps-${{ github.run_id }}
       USERNAME: TOOLBOXLAP
-      PASSWORD: "admin@123"        # اذا اردت تغييره غَيّره هنا
-      REGION: ams3                # غيّر المنطقة اذا رغبت (مثال: nyc3, sfo3, fra1, ams3)
+      PASSWORD: "admin@123"
+      REGION: ams3
       SIZE: s-1vcpu-1gb
       IMAGE: ubuntu-24-04-x64
 
@@ -23,13 +23,12 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y jq curl python3 python3-pip openssh-client
+        sudo apt-get install -y jq curl python3 python3-pip openssh-client sshpass
         pip3 install requests
 
     - name: Build cloud-init user-data
       id: userdata
       run: |
-        # cloud-init user-data: creates user, allows password auth, adds sudo
         cat > user-data.yaml <<'EOF'
         #cloud-config
         preserve_hostname: false
@@ -52,21 +51,20 @@ jobs:
           - python3
           - python3-pip
         runcmd:
-          - [ sh, -c, 'echo "SSH and cloud-init setup done" ]
+          - [ sh, -c, 'echo "SSH setup completed" ]
         EOF
 
-        # Output base64 encoded user-data for safe curl JSON embedding
+        echo "user-data.yaml created."
         UD_B64=$(base64 -w0 user-data.yaml)
-        echo "::set-output name=ud_b64::$UD_B64"
-      shell: bash
+        echo "ud_b64=$UD_B64" >> $GITHUB_OUTPUT
 
-    - name: Create Droplet (DigitalOcean)
+    - name: Create Droplet on DigitalOcean
       id: create
       env:
         DO_TOKEN: ${{ secrets.DO_TOKEN }}
       run: |
         if [ -z "$DO_TOKEN" ]; then
-          echo "ERROR: DO_TOKEN secret is required."
+          echo "❌ ERROR: DO_TOKEN secret is missing."
           exit 1
         fi
 
@@ -92,25 +90,23 @@ jobs:
           -d "$JSON_PAYLOAD")
 
         echo "$create_response" > create_response.json
-        echo "create_response.json saved."
-
         droplet_id=$(jq -r '.droplet.id // empty' create_response.json)
         if [ -z "$droplet_id" ]; then
-          echo "Create failed. Response:"
+          echo "❌ Droplet creation failed."
           jq . create_response.json
           exit 1
         fi
 
-        echo "Droplet ID: $droplet_id"
-        echo "::set-output name=droplet_id::$droplet_id"
+        echo "✅ Droplet ID: $droplet_id"
+        echo "droplet_id=$droplet_id" >> $GITHUB_OUTPUT
 
-    - name: Wait for Droplet active & get IP
+    - name: Wait for Droplet to be active
       id: droplet-info
       env:
         DO_TOKEN: ${{ secrets.DO_TOKEN }}
       run: |
         droplet_id=${{ steps.create.outputs.droplet_id }}
-        echo "Waiting for droplet $droplet_id to become active..."
+        echo "Waiting for droplet $droplet_id..."
         for i in {1..60}; do
           resp=$(curl -s -H "Authorization: Bearer $DO_TOKEN" "https://api.digitalocean.com/v2/droplets/$droplet_id")
           status=$(echo "$resp" | jq -r '.droplet.status // empty')
@@ -118,55 +114,28 @@ jobs:
           if [ "$status" = "active" ]; then
             pub_ip=$(echo "$resp" | jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address' | head -n1)
             if [ -n "$pub_ip" ]; then
-              echo "Droplet public IP: $pub_ip"
-              echo "::set-output name=public_ip::$pub_ip"
+              echo "✅ Droplet IP: $pub_ip"
+              echo "public_ip=$pub_ip" >> $GITHUB_OUTPUT
               exit 0
             fi
           fi
           sleep 5
         done
-        echo "Timed out waiting for droplet to become active or have public IP."
+        echo "❌ Droplet not ready after waiting."
         exit 1
 
-    - name: Wait for SSH ready
-      id: ssh-wait
+    - name: Wait for SSH port open
       run: |
         IP=${{ steps.droplet-info.outputs.public_ip }}
-        echo "Checking SSH on $IP ..."
+        echo "Waiting SSH on $IP ..."
         for i in {1..40}; do
-          nc -z -w5 $IP 22 && { echo "SSH is open"; exit 0; } || echo "SSH not ready yet ($i)"
+          nc -z -w5 $IP 22 && { echo "✅ SSH open"; exit 0; } || echo "SSH not ready ($i)"
           sleep 5
         done
-        echo "SSH port didn't open in time."
+        echo "❌ SSH timeout."
         exit 1
 
-    - name: (Optional) Install Tailscale on VPS
-      if: ${{ secrets.TAILSCALE_AUTH_KEY != '' }}
-      env:
-        IP: ${{ steps.droplet-info.outputs.public_ip }}
-        USERNAME: ${{ env.USERNAME }}
-        PASSWORD: ${{ env.PASSWORD }}
-        TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      run: |
-        ip=$IP
-        echo "Installing tailscale on remote..."
-        # copy a small script and run it remotely using sshpass (we will use password auth)
-        sudo apt-get update -y
-        sudo apt-get install -y sshpass
-        cat > remote-tailscale.sh <<'SH'
-        set -e
-        curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.gpg | sudo gpg --dearmor -o /usr/share/keyrings/tailscale-archive-keyring.gpg
-        echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu jammy main" | sudo tee /etc/apt/sources.list.d/tailscale.list
-        sudo apt-get update
-        sudo apt-get install -y tailscale
-        sudo tailscale up --authkey=${TAILSCALE_AUTH_KEY} --hostname=${DROPLET_NAME}
-        SH
-        chmod +x remote-tailscale.sh
-        sshpass -p "${PASSWORD}" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null remote-tailscale.sh ${USERNAME}@${ip}:/tmp/remote-tailscale.sh
-        sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${USERNAME}@${ip} 'sudo bash /tmp/remote-tailscale.sh'
-
-    - name: Send credentials by email (uses Python)
-      id: send-mail
+    - name: Send credentials via email
       env:
         SMTP_HOST: ${{ secrets.SMTP_HOST }}
         SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -177,11 +146,6 @@ jobs:
         USERNAME: ${{ env.USERNAME }}
         PASSWORD: ${{ env.PASSWORD }}
       run: |
-        if [ -z "$SMTP_HOST" ] || [ -z "$SMTP_USER" ] || [ -z "$SMTP_PASS" ] || [ -z "$EMAIL_TO" ]; then
-          echo "One of SMTP_HOST/SMTP_USER/SMTP_PASS/EMAIL_TO secrets is missing. Skipping email sending."
-          exit 0
-        fi
-
         python3 - <<PY
 import smtplib, os
 from email.message import EmailMessage
@@ -199,33 +163,31 @@ msg = EmailMessage()
 msg['Subject'] = f'VPS ACCESS - {ip}'
 msg['From'] = smtp_user
 msg['To'] = to_addr
-body = f"""
-تم إنشاء VPS بنجاح.
+msg.set_content(f"""
+✅ تم إنشاء VPS بنجاح.
 
-العنوان (IP): {ip}
-المستخدم: {user}
-كلمة المرور: {passwd}
+🔹 العنوان (IP): {ip}
+🔹 المستخدم: {user}
+🔹 كلمة المرور: {passwd}
 
-يمكنك الدخول عبر Termux / SSH كالتالي:
+ادخل من Termux أو أي SSH Client:
 ssh {user}@{ip}
-
-ملحوظة: تم إعداد SSH للسماح بالمصادقة بكلمة المرور (password auth).
-"""
-msg.set_content(body)
+""")
 
 with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
     s.starttls()
     s.login(smtp_user, smtp_pass)
     s.send_message(msg)
-
-print("Email sent to", to_addr)
+print("📧 Email sent successfully to", to_addr)
 PY
 
-    - name: Output access info to workflow log
+    - name: Show VPS Access Info
       run: |
-        echo "=== VPS ACCESS ==="
+        echo "======================"
+        echo "✅ VPS Created Successfully!"
         echo "IP: ${{ steps.droplet-info.outputs.public_ip }}"
         echo "User: ${{ env.USERNAME }}"
         echo "Password: ${{ env.PASSWORD }}"
-        echo "You can SSH: ssh ${{ env.USERNAME }}@${{ steps.droplet-info.outputs.public_ip }}"
-        echo "=================="
+        echo "To connect via Termux:"
+        echo "ssh ${{ env.USERNAME }}@${{ steps.droplet-info.outputs.public_ip }}"
+        echo "======================"
