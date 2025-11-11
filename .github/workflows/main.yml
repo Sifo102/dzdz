@@ -1,71 +1,148 @@
-name: Create VPS with Tailscale
+name: VPS-from-RDP
+
 on:
   workflow_dispatch:
 
 jobs:
-  create-vps:
-    runs-on: ubuntu-latest
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    env:
+      RDP_USER: "TOOLBOXLAP"
+      RDP_PASS: "admin@123"
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      # --- 1️⃣ إعداد AWS CLI ---
-      - name: Configure AWS CLI
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-
-      # --- 2️⃣ إنشاء VPS على EC2 ---
-      - name: Launch EC2 Instance
-        id: ec2
+      - name: Configure Core RDP Settings
+        shell: pwsh
         run: |
-          INSTANCE_ID=$(aws ec2 run-instances \
-            --image-id ami-0c02fb55956c7d316 \
-            --instance-type t2.medium \
-            --key-name MyKeyPair \
-            --security-group-ids sg-xxxxxxxx \
-            --subnet-id subnet-xxxxxxxx \
-            --associate-public-ip-address \
-            --query 'Instances[0].InstanceId' \
-            --output text)
-          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+          Write-Host "==> Configure Core RDP Settings"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
 
-      # --- 3️⃣ الانتظار حتى يصبح VPS جاهز ---
-      - name: Wait for EC2 to be running
+          # firewall rule (delete if exists then add)
+          Write-Host "==> Configure Firewall rule for RDP (3389)"
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          Write-Host "==> Restart TermService"
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Static Password
+        shell: pwsh
         run: |
-          aws ec2 wait instance-running --instance-ids ${{ env.INSTANCE_ID }}
-          PUBLIC_IP=$(aws ec2 describe-instances \
-            --instance-ids ${{ env.INSTANCE_ID }} \
-            --query 'Reservations[0].Instances[0].PublicIpAddress' \
-            --output text)
-          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
-          echo "VPS Public IP: $PUBLIC_IP"
+          Write-Host "==> Create local user and add to groups"
+          $password = "${{ env.RDP_PASS }}"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-      # --- 4️⃣ إعداد Tailscale + RDP على VPS عبر PowerShell Remoting ---
-      - name: Setup VPS via PowerShell
+          if (-not (Get-Command Get-LocalUser -ErrorAction SilentlyContinue)) {
+            Write-Host "Get-LocalUser not available on this runner - attempting alternative creation..."
+          }
+
+          if (-not (Get-LocalUser -Name "${{ env.RDP_USER }}" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "${{ env.RDP_USER }}" -Password $securePass -AccountNeverExpires -PasswordNeverExpires:$true
+            Write-Host "User created: $($env:RDP_USER)"
+          } else {
+            Write-Host "User already exists: $($env:RDP_USER)"
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "${{ env.RDP_USER }}" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "${{ env.RDP_USER }}" -ErrorAction SilentlyContinue
+
+          # export credentials to GitHub environment so later steps can use them
+          Add-Content -Path $env:GITHUB_ENV -Value ("RDP_CREDS=User: $($env:RDP_USER) | Password: $password")
+
+          if (-not (Get-LocalUser -Name "${{ env.RDP_USER }}" -ErrorAction SilentlyContinue)) {
+            Write-Error "User creation failed"
+            exit 1
+          }
+
+      - name: Install Tailscale
+        shell: pwsh
         run: |
-          pwsh -Command "
-          $ip = '${{ env.PUBLIC_IP }}';
-          $user = 'TOOLBOXLAP';
-          $password = 'admin@123';
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force;
-          Invoke-Command -ComputerName $ip -ScriptBlock {
-              # إنشاء المستخدم
-              if (-not (Get-LocalUser -Name $using:user)) { New-LocalUser -Name $using:user -Password $using:securePass -AccountNeverExpires }
-              Add-LocalGroupMember -Group 'Administrators' -Member $using:user
-              Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $using:user
+          Write-Host "==> Download and install Tailscale MSI"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          Start-Process -FilePath "msiexec.exe" -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item -Path $installerPath -Force -ErrorAction SilentlyContinue
+          Write-Host "Tailscale installed (if installation succeeded)."
 
-              # تفعيل RDP
-              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
-              Restart-Service -Name TermService -Force
+      - name: Establish Tailscale Connection (if auth key provided)
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if (-not $env:TAILSCALE_AUTH_KEY -or $env:TAILSCALE_AUTH_KEY -eq "") {
+            Write-Host "No TAILSCALE_AUTH_KEY found in secrets. Skipping 'tailscale up'."
+            Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP="
+            exit 0
+          }
 
-              # تثبيت Tailscale
-              $tsUrl='https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi';
-              $installerPath='$env:TEMP\tailscale.msi';
-              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath;
-              Start-Process msiexec.exe -ArgumentList '/i', "`"$installerPath`"", '/quiet', '/norestart' -Wait;
-              Remove-Item $installerPath -Force;
-              & '$env:ProgramFiles\Tailscale\tailscale.exe' up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname='vps-github';
-          }"
+          Write-Host "==> Running 'tailscale up' with provided auth key"
+          $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "Tailscale executable not found at $exe"
+            exit 1
+          }
+
+          & $exe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+          # wait for IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 12) {
+            try {
+              $tsIP = & $exe ip -4 2>$null
+            } catch {
+              $tsIP = $null
+            }
+            if ($tsIP) { break }
+            Start-Sleep -Seconds 5
+            $retries++
+          }
+
+          if (-not $tsIP) {
+            Write-Error "Tailscale IP not assigned after retries. Continuing but TAILSCALE_IP will be empty."
+            Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP="
+          } else {
+            $tsIP = $tsIP.Trim()
+            Write-Host "Tailscale IP: $tsIP"
+            Add-Content -Path $env:GITHUB_ENV -Value ("TAILSCALE_IP=$tsIP")
+          }
+
+      - name: Verify RDP Accessibility (via Tailscale IP if present)
+        shell: pwsh
+        run: |
+          $tsIP = (Get-Content $env:GITHUB_ENV | Select-String -Pattern '^TAILSCALE_IP=' | ForEach-Object { $_ -replace '^TAILSCALE_IP=', '' }).Trim()
+          if ($tsIP -and $tsIP -ne "") {
+            Write-Host "Tailscale IP detected: $tsIP - testing TCP:3389"
+            $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -WarningAction SilentlyContinue
+            if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 on $tsIP failed"
+            } else {
+              Write-Host "TCP connectivity to $tsIP:3389 successful!"
+            }
+          } else {
+            Write-Host "No Tailscale IP available. Skipping remote connectivity test."
+          }
+
+      - name: Maintain Connection / Output credentials
+        shell: pwsh
+        run: |
+          $tailIP = (Get-Content $env:GITHUB_ENV | Select-String -Pattern '^TAILSCALE_IP=' | ForEach-Object { $_ -replace '^TAILSCALE_IP=', '' }).Trim()
+          $creds = (Get-Content $env:GITHUB_ENV | Select-String -Pattern '^RDP_CREDS=' | ForEach-Object { $_ -replace '^RDP_CREDS=', '' }).Trim()
+          Write-Host "`n=== RDP ACCESS ==="
+          if ($tailIP -and $tailIP -ne "") {
+            Write-Host "Address (Tailscale): $tailIP"
+          } else {
+            Write-Host "Address: (No Tailscale IP - use runner public or check TAILSCALE_AUTH_KEY)"
+          }
+          Write-Host "Credentials: $creds"
+          Write-Host "==================`n"
+
+          Write-Host "Maintaining workflow run - process will print status every 5 minutes. Use 'Cancel workflow' in Actions to stop."
+          while ($true) {
+            Write-Host "[$(Get-Date -Format u)] RDP Active - Use Cancel workflow in Actions to terminate"
+            Start-Sleep -Seconds 300
+          }
