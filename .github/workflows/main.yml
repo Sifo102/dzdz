@@ -1,310 +1,231 @@
-name: VPS Server
+name: Create-VPS
+
 on:
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: windows-latest
-    timeout-minutes: 28800
+  create-vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    env:
+      DROPLET_NAME: gh-vps-${{ github.run_id }}
+      USERNAME: TOOLBOXLAP
+      PASSWORD: "admin@123"        # اذا اردت تغييره غَيّره هنا
+      REGION: ams3                # غيّر المنطقة اذا رغبت (مثال: nyc3, sfo3, fra1, ams3)
+      SIZE: s-1vcpu-1gb
+      IMAGE: ubuntu-24-04-x64
 
     steps:
-      - name: Configure Windows as VPS
-        run: |
-          Write-Host "Configuring Windows as VPS Server..."
-          
-          # تعطيل كافة إعدادات الطاقة
-          powercfg -change -standby-timeout-ac 0
-          powercfg -change -hibernate-timeout-ac 0
-          powercfg -change -monitor-timeout-ac 0
-          powercfg -change -disk-timeout-ac 0
-          powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+    - name: Checkout
+      uses: actions/checkout@v4
 
-          # تعطيل التحديثات التلقائية
-          Stop-Service -Name "wuauserv" -Force
-          Set-Service -Name "wuauserv" -StartupType Disabled
-          Stop-Service -Name "UsoSvc" -Force
-          Set-Service -Name "UsoSvc" -StartupType Disabled
+    - name: Install dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y jq curl python3 python3-pip openssh-client
+        pip3 install requests
 
-          # إعدادات التسجيل لمنع الإيقاف التلقائي
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoUpdate" -Value 1 -Force
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoRebootWithLoggedOnUsers" -Value 1 -Force
+    - name: Build cloud-init user-data
+      id: userdata
+      run: |
+        # cloud-init user-data: creates user, allows password auth, adds sudo
+        cat > user-data.yaml <<'EOF'
+        #cloud-config
+        preserve_hostname: false
+        hostname: ${DROPLET_NAME}
+        users:
+          - name: ${USERNAME}
+            gecos: "Toolbox User"
+            lock_passwd: false
+            plain_text_passwd: "${PASSWORD}"
+            sudo: ALL=(ALL) NOPASSWD:ALL
+            groups: [sudo]
+            shell: /bin/bash
+        ssh_pwauth: true
+        disable_root: false
+        packages:
+          - htop
+          - curl
+          - wget
+          - git
+          - python3
+          - python3-pip
+        runcmd:
+          - [ sh, -c, 'echo "SSH and cloud-init setup done" ]
+        EOF
 
-          Write-Host "VPS base configuration completed"
+        # Output base64 encoded user-data for safe curl JSON embedding
+        UD_B64=$(base64 -w0 user-data.yaml)
+        echo "::set-output name=ud_b64::$UD_B64"
+      shell: bash
 
-      - name: Create VPS Admin User
-        run: |
-          $username = "VPSADMIN"
-          $password = "admin@123"
-          
-          # إنشاء مستخدم VPS
-          Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
-          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name $username -Password $securePassword -AccountNeverExpires
-          
-          # منح صلاحيات المدير
-          Add-LocalGroupMember -Group "Administrators" -Member $username
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
-          Set-LocalUser -Name $username -PasswordNeverExpires $true
-          
-          echo "VPS_USER=$username" >> $env:GITHUB_ENV
-          echo "VPS_PASSWORD=$password" >> $env:GITHUB_ENV
-          Write-Host "VPS Admin user created successfully"
+    - name: Create Droplet (DigitalOcean)
+      id: create
+      env:
+        DO_TOKEN: ${{ secrets.DO_TOKEN }}
+      run: |
+        if [ -z "$DO_TOKEN" ]; then
+          echo "ERROR: DO_TOKEN secret is required."
+          exit 1
+        fi
 
-      - name: Enable and Configure RDP for VPS
-        run: |
-          # تمكين RDP
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          
-          # إعدادات لمنع انتهاء الجلسة
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxConnectionTime" -Value 2147483647 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxDisconnectionTime" -Value 2147483647 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxIdleTime" -Value 2147483647 -Force
-          
-          # فتح منفذ RDP
-          netsh advfirewall firewall add rule name="VPS-RDP" dir=in action=allow protocol=TCP localport=3389
-          
-          # إعادة تشغيل الخدمة
-          Restart-Service -Name TermService -Force
-          Write-Host "RDP configured for VPS access"
+        UD_B64=${{ steps.userdata.outputs.ud_b64 }}
+        JSON_PAYLOAD=$(cat <<EOF
+        {
+          "name":"${DROPLET_NAME}",
+          "region":"${REGION}",
+          "size":"${SIZE}",
+          "image":"${IMAGE}",
+          "backups":false,
+          "ipv6":false,
+          "user_data":"$(base64 --decode <<< "$UD_B64")",
+          "tags":["github-actions","auto-vps"]
+        }
+        EOF
+        )
 
-      - name: Install Tailscale for VPS Networking
-        run: |
-          Write-Host "Installing Tailscale for VPS networking..."
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -Wait -ArgumentList @(
-            "/i",
-            "`"$installerPath`"",
-            "/quiet",
-            "/norestart"
-          )
-          Remove-Item $installerPath -Force
-          Start-Sleep -Seconds 10
-          Write-Host "Tailscale installed successfully"
+        echo "Creating droplet..."
+        create_response=$(curl -s -X POST "https://api.digitalocean.com/v2/droplets" \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer $DO_TOKEN" \
+          -d "$JSON_PAYLOAD")
 
-      - name: Setup Persistent Tailscale Connection
-        run: |
-          Write-Host "Setting up persistent Tailscale connection..."
-          
-          # تشغيل Tailscale مع إعدادات VPS
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=vps-server-20d --accept-routes --accept-dns --reset
-          
-          # الحصول على IP
-          $tsIP = $null
-          for ($i = 1; $i -le 25; $i++) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              if ($tsIP) {
-                  echo "VPS_IP=$tsIP" >> $env:GITHUB_ENV
-                  Write-Host "VPS IP Address: $tsIP"
-                  break
-              }
-              Write-Host "Waiting for VPS IP... ($i/25)"
-              Start-Sleep -Seconds 4
-          }
-          
-          if (-not $tsIP) {
-              Write-Host "Using alternative method to get IP..."
-              try {
-                  $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
-                  $tsIP = $status.Self.TailscaleIPs[0]
-                  if ($tsIP) {
-                      echo "VPS_IP=$tsIP" >> $env:GITHUB_ENV
-                  }
-              } catch {
-                  Write-Host "Could not get IP, but continuing..."
-              }
-          }
+        echo "$create_response" > create_response.json
+        echo "create_response.json saved."
 
-      - name: Configure VPS Services
-        run: |
-          Write-Host "Configuring VPS services..."
-          
-          # تعطيل الخدمات غير الضرورية للـ VPS
-          $servicesToDisable = @(
-              "XboxGipSvc",
-              "XboxNetApiSvc", 
-              "WSearch",
-              "TabletInputService",
-              "Fax",
-              "MapsBroker"
-          )
-          
-          foreach ($service in $servicesToDisable) {
-              Stop-Service -Name $service -Force -ErrorAction SilentlyContinue
-              Set-Service -Name $service -StartupType Disabled -ErrorAction SilentlyContinue
-          }
-          
-          # تمكين الخدمات الهامة
-          $servicesToEnable = @(
-              "TermService",
-              "SessionEnv",
-              "UmRdpService"
-          )
-          
-          foreach ($service in $servicesToEnable) {
-              Set-Service -Name $service -StartupType Automatic -ErrorAction SilentlyContinue
-              Start-Service -Name $service -ErrorAction SilentlyContinue
-          }
-          
-          Write-Host "VPS services configured"
+        droplet_id=$(jq -r '.droplet.id // empty' create_response.json)
+        if [ -z "$droplet_id" ]; then
+          echo "Create failed. Response:"
+          jq . create_response.json
+          exit 1
+        fi
 
-      - name: Create VPS Maintenance Script
-        run: |
-          Write-Host "Creating VPS maintenance script..."
-          
-          $maintenanceScript = @'
-          # VPS Maintenance Script
-          `$logPath = "C:\vps-status.log"
-          `$startTime = Get-Date
-          `$endTime = `$startTime.AddDays(20)
-          
-          function Log-Message {
-              param([string]`$message)
-              `$timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-              `$logEntry = "[`$timestamp] `$message"
-              Add-Content -Path `$logPath -Value `$logEntry
-              Write-Host `$logEntry
-          }
-          
-          Log-Message "VPS Server started - 20 days session"
-          
-          while ((Get-Date) -lt `$endTime) {
-              `$remaining = `$endTime - (Get-Date)
-              `$days = [math]::Round(`$remaining.TotalDays, 2)
-              
-              # التحقق من الخدمات الأساسية كل 10 دقائق
-              `$essentialServices = @("TermService", "SessionEnv")
-              foreach (`$service in `$essentialServices) {
-                  `$svc = Get-Service -Name `$service -ErrorAction SilentlyContinue
-                  if (`$svc.Status -ne "Running") {
-                      Log-Message "Service `$service is not running - restarting"
-                      Start-Service -Name `$service -Force
-                  }
-              }
-              
-              # التحقق من اتصال Tailscale كل 30 دقيقة
-              if ((Get-Date).Minute % 30 -eq 0) {
-                  try {
-                      `$currentIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-                      if (-not `$currentIP) {
-                          Log-Message "Tailscale disconnected - reconnecting"
-                          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --reset
-                      }
-                  } catch {
-                      Log-Message "Tailscale check failed: `$(`_.Exception.Message)"
-                  }
-              }
-              
-              # تسجيل الحالة كل ساعة
-              if ((Get-Date).Minute % 60 -eq 0) {
-                  Log-Message "VPS Active - `$days days remaining - IP: `$(`$currentIP)"
-              }
-              
-              Start-Sleep -Seconds 300
-          }
-          
-          Log-Message "VPS 20-day session completed successfully"
-'@
-          
-          Set-Content -Path "C:\vps-maintenance.ps1" -Value $maintenanceScript
-          Write-Host "VPS maintenance script created"
+        echo "Droplet ID: $droplet_id"
+        echo "::set-output name=droplet_id::$droplet_id"
 
-      - name: Start VPS Server
-        run: |
-          Write-Host "Starting VPS Server..."
-          
-          # بدء سكريبت الصيانة
-          Start-Process PowerShell.exe -ArgumentList "-WindowStyle Hidden -File C:\vps-maintenance.ps1" -WindowStyle Hidden
-          
-          Write-Host ""
-          Write-Host "========================================================"
-          Write-Host "🎯 VPS SERVER READY - 20 DAYS"
-          Write-Host "========================================================"
-          Write-Host "🌐 IP Address: $env:VPS_IP"
-          Write-Host "👤 Username: $env:VPS_USER"
-          Write-Host "🔑 Password: $env:VPS_PASSWORD"
-          Write-Host ""
-          Write-Host "⏰ Duration: 20 DAYS"
-          Write-Host "🕐 Start: $(Get-Date)"
-          Write-Host "📅 End: $((Get-Date).AddDays(20))"
-          Write-Host ""
-          Write-Host "🔧 Features:"
-          Write-Host "  • Full Windows VPS"
-          Write-Host "  • Persistent Connection"
-          Write-Host "  • Static IP"
-          Write-Host "  • 24/7 Availability"
-          Write-Host "  • Auto Maintenance"
-          Write-Host "========================================================"
-          Write-Host ""
+    - name: Wait for Droplet active & get IP
+      id: droplet-info
+      env:
+        DO_TOKEN: ${{ secrets.DO_TOKEN }}
+      run: |
+        droplet_id=${{ steps.create.outputs.droplet_id }}
+        echo "Waiting for droplet $droplet_id to become active..."
+        for i in {1..60}; do
+          resp=$(curl -s -H "Authorization: Bearer $DO_TOKEN" "https://api.digitalocean.com/v2/droplets/$droplet_id")
+          status=$(echo "$resp" | jq -r '.droplet.status // empty')
+          echo "Attempt $i - status: $status"
+          if [ "$status" = "active" ]; then
+            pub_ip=$(echo "$resp" | jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address' | head -n1)
+            if [ -n "$pub_ip" ]; then
+              echo "Droplet public IP: $pub_ip"
+              echo "::set-output name=public_ip::$pub_ip"
+              exit 0
+            fi
+          fi
+          sleep 5
+        done
+        echo "Timed out waiting for droplet to become active or have public IP."
+        exit 1
 
-      - name: Keep VPS Alive for 20 Days
-        run: |
-          $totalSeconds = 20 * 24 * 60 * 60  # 20 يوم بالثواني
-          $checkInterval = 300  # كل 5 دقائق
-          $totalChecks = $totalSeconds / $checkInterval
-          $checkCount = 0
-          
-          for ($i = 0; $i -lt $totalChecks; $i++) {
-              $currentTime = Get-Date
-              $elapsed = $currentTime - (Get-Date).AddDays(-20).AddSeconds($totalSeconds)
-              $remainingDays = 20 - [math]::Round($elapsed.TotalDays, 2)
-              
-              # عرض الحالة كل ساعة
-              if ($checkCount % 12 -eq 0) {
-                  Write-Host "[$(Get-Date)] VPS Server Active - $remainingDays days remaining"
-                  
-                  # التحقق من السجلات
-                  try {
-                      if (Test-Path "C:\vps-status.log") {
-                          $lastLog = Get-Content "C:\vps-status.log" -Tail 1 -ErrorAction SilentlyContinue
-                          if ($lastLog) {
-                              Write-Host "Last log: $lastLog"
-                          }
-                      }
-                  } catch {
-                      # تجاهل أخطاء القراءة
-                  }
-              }
-              
-              # فحص شامل كل 6 ساعات
-              if ($checkCount % 72 -eq 0) {
-                  Write-Host "Performing VPS health check..."
-                  
-                  # التحقق من الخدمات
-                  $services = @("TermService", "SessionEnv")
-                  foreach ($service in $services) {
-                      $svc = Get-Service -Name $service -ErrorAction SilentlyContinue
-                      if ($svc.Status -ne "Running") {
-                          Write-Host "Starting service: $service"
-                          Start-Service -Name $service -Force
-                      }
-                  }
-                  
-                  # التحقق من Tailscale
-                  try {
-                      $currentIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-                      if (-not $currentIP) {
-                          Write-Host "Reconnecting Tailscale..."
-                          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --reset
-                      } else {
-                          Write-Host "Tailscale IP: $currentIP"
-                      }
-                  } catch {
-                      Write-Host "Tailscale check error: $($_.Exception.Message)"
-                  }
-                  
-                  Write-Host "VPS health check completed"
-              }
-              
-              $checkCount++
-              Start-Sleep -Seconds $checkInterval
-          }
-          
-          Write-Host "========================================================"
-          Write-Host "✅ VPS 20-DAY SESSION COMPLETED"
-          Write-Host "🕐 Finished at: $(Get-Date)"
-          Write-Host "========================================================"
+    - name: Wait for SSH ready
+      id: ssh-wait
+      run: |
+        IP=${{ steps.droplet-info.outputs.public_ip }}
+        echo "Checking SSH on $IP ..."
+        for i in {1..40}; do
+          nc -z -w5 $IP 22 && { echo "SSH is open"; exit 0; } || echo "SSH not ready yet ($i)"
+          sleep 5
+        done
+        echo "SSH port didn't open in time."
+        exit 1
+
+    - name: (Optional) Install Tailscale on VPS
+      if: ${{ secrets.TAILSCALE_AUTH_KEY != '' }}
+      env:
+        IP: ${{ steps.droplet-info.outputs.public_ip }}
+        USERNAME: ${{ env.USERNAME }}
+        PASSWORD: ${{ env.PASSWORD }}
+        TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      run: |
+        ip=$IP
+        echo "Installing tailscale on remote..."
+        # copy a small script and run it remotely using sshpass (we will use password auth)
+        sudo apt-get update -y
+        sudo apt-get install -y sshpass
+        cat > remote-tailscale.sh <<'SH'
+        set -e
+        curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.gpg | sudo gpg --dearmor -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu jammy main" | sudo tee /etc/apt/sources.list.d/tailscale.list
+        sudo apt-get update
+        sudo apt-get install -y tailscale
+        sudo tailscale up --authkey=${TAILSCALE_AUTH_KEY} --hostname=${DROPLET_NAME}
+        SH
+        chmod +x remote-tailscale.sh
+        sshpass -p "${PASSWORD}" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null remote-tailscale.sh ${USERNAME}@${ip}:/tmp/remote-tailscale.sh
+        sshpass -p "${PASSWORD}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${USERNAME}@${ip} 'sudo bash /tmp/remote-tailscale.sh'
+
+    - name: Send credentials by email (uses Python)
+      id: send-mail
+      env:
+        SMTP_HOST: ${{ secrets.SMTP_HOST }}
+        SMTP_PORT: ${{ secrets.SMTP_PORT }}
+        SMTP_USER: ${{ secrets.SMTP_USER }}
+        SMTP_PASS: ${{ secrets.SMTP_PASS }}
+        EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        IP: ${{ steps.droplet-info.outputs.public_ip }}
+        USERNAME: ${{ env.USERNAME }}
+        PASSWORD: ${{ env.PASSWORD }}
+      run: |
+        if [ -z "$SMTP_HOST" ] || [ -z "$SMTP_USER" ] || [ -z "$SMTP_PASS" ] || [ -z "$EMAIL_TO" ]; then
+          echo "One of SMTP_HOST/SMTP_USER/SMTP_PASS/EMAIL_TO secrets is missing. Skipping email sending."
+          exit 0
+        fi
+
+        python3 - <<PY
+import smtplib, os
+from email.message import EmailMessage
+
+smtp_host=os.environ['SMTP_HOST']
+smtp_port=int(os.environ.get('SMTP_PORT') or 587)
+smtp_user=os.environ['SMTP_USER']
+smtp_pass=os.environ['SMTP_PASS']
+to_addr=os.environ['EMAIL_TO']
+ip=os.environ['IP']
+user=os.environ['USERNAME']
+passwd=os.environ['PASSWORD']
+
+msg = EmailMessage()
+msg['Subject'] = f'VPS ACCESS - {ip}'
+msg['From'] = smtp_user
+msg['To'] = to_addr
+body = f"""
+تم إنشاء VPS بنجاح.
+
+العنوان (IP): {ip}
+المستخدم: {user}
+كلمة المرور: {passwd}
+
+يمكنك الدخول عبر Termux / SSH كالتالي:
+ssh {user}@{ip}
+
+ملحوظة: تم إعداد SSH للسماح بالمصادقة بكلمة المرور (password auth).
+"""
+msg.set_content(body)
+
+with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
+    s.starttls()
+    s.login(smtp_user, smtp_pass)
+    s.send_message(msg)
+
+print("Email sent to", to_addr)
+PY
+
+    - name: Output access info to workflow log
+      run: |
+        echo "=== VPS ACCESS ==="
+        echo "IP: ${{ steps.droplet-info.outputs.public_ip }}"
+        echo "User: ${{ env.USERNAME }}"
+        echo "Password: ${{ env.PASSWORD }}"
+        echo "You can SSH: ssh ${{ env.USERNAME }}@${{ steps.droplet-info.outputs.public_ip }}"
+        echo "=================="
