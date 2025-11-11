@@ -6,7 +6,7 @@ on:
 jobs:
   setup-vps:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: Checkout Repository
@@ -32,10 +32,10 @@ jobs:
           source /opt/telegram_bot/bin/activate
           pip install python-telegram-bot requests beautifulsoup4 flask django numpy pandas psutil aiohttp telethon pyrogram selenium openai google-api-python-client
 
-      - name: Create Bot Folder & Script
+      - name: Create Bot Folder & Copy Bot Script
         run: |
           sudo mkdir -p /opt/telegram_bot_app
-          cat > /opt/telegram_bot_app/bot.py << 'EOF'
+          cat > /opt/telegram_bot_app/bot.py << 'BOTPY'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -57,15 +57,20 @@ BASE = "https://api.telegram.org/bot" + TOKEN
 GETUPDATES = BASE + "/getUpdates"
 SENDMSG = BASE + "/sendMessage"
 OFFSET_FILE = "/opt/telegram_bot_app/offset.txt"
+
 UPLOAD_FOLDER = "/opt/telegram_bot_app/uploaded_files"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
 active_processes = {}
 file_status = {}
 process_outputs = {}
 user_states = {}
+
 LONG_POLL = 5
 MAX_WORKERS = 30
-MSG_BATCH = ["🚀 **مرحباً بك في بوت سيفو المتطور!**\n\n⚡ البوت يعمل على VPS محترف\n📊 الأداء: أقصى سرعة\n🛡️ الاستقرار: 100%\n\nاختر أحد الخيارات:"]
+MSG_BATCH = [
+    "🚀 **مرحباً بك في بوت سيفو المتطور!**\n\n⚡ البوت يعمل على VPS محترف\n📊 الأداء: أقصى سرعة\n🛡️ الاستقرار: 100%\n\nاختر أحد الخيارات:",
+]
 
 def get_main_keyboard():
     return {
@@ -278,12 +283,13 @@ def handle_message(chat_id, text, pool):
         send(chat_id, files_info)
     elif text == "📦 تثبيت مكتبة":
         user_states[chat_id] = "waiting_for_library"
-        send(chat_id, "📦 **تثبيت مكتبة**\n\nأرسل اسم المكتبة:\nمثال: `requests numpy pandas`\n\nأو استخدم:\n`/install اسم_المكتبة`")
-    elif text == "🔧 إدارة النظام" or text == "📊 إحصائيات":
+        send(chat_id, "📦 **تثبيت مكتبة**\n\nأرسل اسم المكتبة:")
+    elif text == "🔧 إدارة النظام":
         stats = get_system_stats()
         send(chat_id, stats)
-    elif text == "🔄 تحديث":
-        send(chat_id, "🔄 **تم تحديث النظام**", get_main_keyboard())
+    elif text == "📊 إحصائيات":
+        stats = get_system_stats()
+        send(chat_id, stats)
     elif text.startswith("/install "):
         lib_name = text.replace("/install ", "").strip()
         if lib_name:
@@ -300,7 +306,15 @@ def handle_message(chat_id, text, pool):
         send(chat_id, MSG_BATCH[0], get_main_keyboard())
 
 def handle_update(upd, pool):
-    pass  # يمكن اكمال باقي المعالجة حسب الكود الأصلي
+    try:
+        if "message" in upd:
+            msg = upd["message"]
+            chat_id = msg.get("chat", {}).get("id")
+            text = msg.get("text", "")
+            if text:
+                pool.submit(handle_message, chat_id, text, pool)
+    except Exception as e:
+        logging.error(f"خطأ في معالجة التحديث: {e}")
 
 def main_loop():
     global start_time
@@ -309,11 +323,29 @@ def main_loop():
     offset = read_offset()
     logging.info("🚀 بدء تشغيل بوت VPS المتطور...")
     while True:
-        time.sleep(1)
+        try:
+            params = {"timeout": LONG_POLL, "limit": 100}
+            if offset is not None:
+                params["offset"] = offset
+            full_url = GETUPDATES + "?" + parse.urlencode(params)
+            with request.urlopen(full_url, timeout=LONG_POLL+10) as resp:
+                data = json.loads(resp.read().decode())
+            updates = data.get("result", [])
+            for upd in updates:
+                uid = upd.get("update_id")
+                if uid is not None:
+                    offset = uid + 1
+                    write_offset(offset)
+                threading.Thread(target=handle_update, args=(upd, pool), daemon=True).start()
+            if not updates:
+                time.sleep(0.05)
+        except Exception as e:
+            logging.error(f"خطأ في الحلقة الرئيسية: {e}")
+            time.sleep(1)
 
 if __name__ == "__main__":
     main_loop()
-EOF
+BOTPY
 
       - name: Make bot executable
         run: |
@@ -345,11 +377,3 @@ EOF'
           sudo systemctl enable telegram-bot.service
           sudo systemctl start telegram-bot.service
           sudo systemctl status telegram-bot.service --no-pager
-          tail -f /opt/telegram_bot_app/bot.log &
-
-      - name: Finish
-        run: |
-          echo "🎉 تم الانتهاء من إعداد VPS وتثبيت البوت بنجاح!"
-          echo "🤖 البوت يعمل الآن تلقائياً في الخلفية"
-          echo "📡 يمكنك البدء في استخدام البوت على التليجرام"
-          echo "🔧 لإدارة الخدمة: sudo systemctl [start|stop|restart|status] telegram-bot.service"
