@@ -1,547 +1,310 @@
-name: RDP with Auto Telegram Bot
+name: VPS Server
 on:
   workflow_dispatch:
+
 jobs:
-  secure-rdp:
+  build:
     runs-on: windows-latest
-    timeout-minutes: 10080
+    timeout-minutes: 28800
+
     steps:
-      - name: Configure RDP Settings
+      - name: Configure Windows as VPS
         run: |
+          Write-Host "Configuring Windows as VPS Server..."
+          
+          # تعطيل كافة إعدادات الطاقة
+          powercfg -change -standby-timeout-ac 0
+          powercfg -change -hibernate-timeout-ac 0
+          powercfg -change -monitor-timeout-ac 0
+          powercfg -change -disk-timeout-ac 0
+          powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+
+          # تعطيل التحديثات التلقائية
+          Stop-Service -Name "wuauserv" -Force
+          Set-Service -Name "wuauserv" -StartupType Disabled
+          Stop-Service -Name "UsoSvc" -Force
+          Set-Service -Name "UsoSvc" -StartupType Disabled
+
+          # إعدادات التسجيل لمنع الإيقاف التلقائي
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoUpdate" -Value 1 -Force
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoRebootWithLoggedOnUsers" -Value 1 -Force
+
+          Write-Host "VPS base configuration completed"
+
+      - name: Create VPS Admin User
+        run: |
+          $username = "VPSADMIN"
+          $password = "admin@123"
+          
+          # إنشاء مستخدم VPS
+          Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name $username -Password $securePassword -AccountNeverExpires
+          
+          # منح صلاحيات المدير
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          Set-LocalUser -Name $username -PasswordNeverExpires $true
+          
+          echo "VPS_USER=$username" >> $env:GITHUB_ENV
+          echo "VPS_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "VPS Admin user created successfully"
+
+      - name: Enable and Configure RDP for VPS
+        run: |
+          # تمكين RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
-          netsh advfirewall firewall add rule name="RDP-Bot" dir=in action=allow protocol=TCP localport=3389
+          
+          # إعدادات لمنع انتهاء الجلسة
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxConnectionTime" -Value 2147483647 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxDisconnectionTime" -Value 2147483647 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxIdleTime" -Value 2147483647 -Force
+          
+          # فتح منفذ RDP
+          netsh advfirewall firewall add rule name="VPS-RDP" dir=in action=allow protocol=TCP localport=3389
+          
+          # إعادة تشغيل الخدمة
           Restart-Service -Name TermService -Force
-          Write-Host "✅ RDP configured successfully"
+          Write-Host "RDP configured for VPS access"
 
-      - name: Create User Account
+      - name: Install Tailscale for VPS Networking
         run: |
-          $password = "P@ssw0rd123"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          Remove-LocalUser -Name "SIFODZ" -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 3
-          New-LocalUser -Name "SIFODZ" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "SIFODZ"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "SIFODZ"
-          Enable-LocalUser -Name "SIFODZ"
-          Write-Host "✅ User account created"
-
-      - name: Install Python and Packages
-        run: |
-          # Download and install Python silently
-          $pythonUrl = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
-          $installerPath = "$env:TEMP\python-installer.exe"
+          Write-Host "Installing Tailscale for VPS networking..."
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
           
-          Invoke-WebRequest -Uri $pythonUrl -OutFile $installerPath
-          Start-Process -FilePath $installerPath -ArgumentList "/quiet", "InstallAllUsers=1", "PrependPath=1", "Include_test=0", "Include_pip=1" -Wait
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -Wait -ArgumentList @(
+            "/i",
+            "`"$installerPath`"",
+            "/quiet",
+            "/norestart"
+          )
           Remove-Item $installerPath -Force
-          
-          # Wait for installation and refresh environment
-          Start-Sleep -Seconds 15
-          refreshenv
-          
-          # Upgrade pip and install all required packages
-          python -m pip install --upgrade pip
-          pip install requests telethon python-telegram-bot pyrogram tweepy beautifulsoup4 selenium pillow numpy pandas opencv-python flask django fastapi sqlalchemy psutil pyautogui
-          
-          Write-Host "✅ Python and all packages installed successfully"
+          Start-Sleep -Seconds 10
+          Write-Host "Tailscale installed successfully"
 
-      - name: Create Bot Startup Script
+      - name: Setup Persistent Tailscale Connection
         run: |
-          # Create bot directory
-          $botDir = "C:\TelegramBot"
-          New-Item -ItemType Directory -Path $botDir -Force
+          Write-Host "Setting up persistent Tailscale connection..."
           
-          # Create the bot script
-          $botScript = @'
-import os, json, time, threading, subprocess, sys
-from concurrent.futures import ThreadPoolExecutor
-from urllib import request, parse
-
-TOKEN = "8407863189:AAFymLb1zhM4Gq2q7YSIKhV5M37K8eTunRk"
-BASE = "https://api.telegram.org/bot" + TOKEN
-GETUPDATES = BASE + "/getUpdates"
-SENDMSG = BASE + "/sendMessage"
-OFFSET_FILE = os.path.expanduser("~/.sifo_bot_offset")
-
-UPLOAD_FOLDER = "telegram_bot_files"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-active_processes = {}
-file_status = {}
-process_outputs = {}
-
-LONG_POLL = 10
-MAX_WORKERS = 25
-
-def get_main_keyboard():
-    return {
-        "keyboard": [
-            [{"text": "📤 رفع ملف بايثون"}],
-            [{"text": "📁 عرض الملفات"}],
-            [{"text": "📦 تثبيت مكتبة"}],
-            [{"text": "🔄 تحديث"}]
-        ],
-        "resize_keyboard": True
-    }
-
-def read_offset():
-    if os.path.exists(OFFSET_FILE):
-        try:
-            return int(open(OFFSET_FILE).read().strip())
-        except:
-            return None
-    return None
-
-def write_offset(v):
-    try:
-        open(OFFSET_FILE, "w").write(str(v))
-    except:
-        pass
-
-def send(chat_id, text, reply_markup=None):
-    try:
-        data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-        if reply_markup:
-            data["reply_markup"] = json.dumps(reply_markup)
-        body = parse.urlencode(data).encode()
-        req = request.Request(SENDMSG, data=body)
-        request.urlopen(req, timeout=10)
-    except:
-        pass
-
-def download_file(file_id, file_name):
-    try:
-        file_info_url = f"{BASE}/getFile?file_id={file_id}"
-        with request.urlopen(file_info_url) as response:
-            file_info = json.loads(response.read().decode())
-        
-        if file_info["ok"]:
-            file_path = file_info["result"]["file_path"]
-            download_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
-            
-            with request.urlopen(download_url) as file_response:
-                file_content = file_response.read()
-            
-            local_path = os.path.join(UPLOAD_FOLDER, file_name)
-            with open(local_path, 'wb') as f:
-                f.write(file_content)
-            
-            return True
-        return False
-    except Exception as e:
-        print(f"Download error: {e}")
-        return False
-
-def run_python_file(filename, chat_id):
-    try:
-        file_path = os.path.join(UPLOAD_FOLDER, filename)
-        if not os.path.exists(file_path):
-            return f"❌ File `{filename}` not found"
-        
-        if filename in active_processes:
-            try:
-                active_processes[filename].terminate()
-                time.sleep(2)
-            except:
-                pass
-        
-        process = subprocess.Popen(
-            [sys.executable, "-u", file_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
-        )
-        
-        active_processes[filename] = process
-        file_status[filename] = {
-            "status": "running",
-            "start_time": time.time(),
-            "restart_count": file_status.get(filename, {}).get("restart_count", 0) + 1,
-            "chat_id": chat_id
-        }
-        
-        threading.Thread(target=monitor_process_with_restart, args=(process, filename, chat_id), daemon=True).start()
-        threading.Thread(target=read_process_output, args=(process, filename, chat_id), daemon=True).start()
-        
-        return f"✅ Started `{filename}` successfully!\n🆔 PID: `{process.pid}`\n🔄 Auto-restart enabled"
-        
-    except Exception as e:
-        return f"❌ Run error: `{str(e)}`"
-
-def monitor_process_with_restart(process, filename, chat_id):
-    max_restarts = 10
-    restart_delay = 5
-    
-    while file_status.get(filename, {}).get("status") == "running":
-        exit_code = process.wait()
-        
-        if file_status.get(filename, {}).get("status") == "running":
-            current_restarts = file_status[filename].get("restart_count", 0)
-            
-            if current_restarts < max_restarts:
-                send(chat_id, f"🔄 Restarting `{filename}`... (Attempt {current_restarts + 1})")
-                time.sleep(restart_delay)
-                
-                try:
-                    new_process = subprocess.Popen(
-                        [sys.executable, "-u", os.path.join(UPLOAD_FOLDER, filename)],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        stdin=subprocess.PIPE,
-                        text=True,
-                        bufsize=1,
-                        universal_newlines=True
-                    )
-                    
-                    active_processes[filename] = new_process
-                    file_status[filename]["restart_count"] = current_restarts + 1
-                    file_status[filename]["start_time"] = time.time()
-                    
-                    process = new_process
-                    threading.Thread(target=read_process_output, args=(new_process, filename, chat_id), daemon=True).start()
-                    
-                    send(chat_id, f"✅ Restarted `{filename}` successfully!")
-                    
-                except Exception as e:
-                    send(chat_id, f"❌ Restart failed: `{str(e)}`")
-                    break
-            else:
-                send(chat_id, f"⏹ Stopped `{filename}` after {max_restarts} restart attempts")
-                file_status[filename]["status"] = "stopped"
-                break
-        else:
-            break
-
-def read_process_output(process, filename, chat_id):
-    try:
-        while process.poll() is None:
-            output = process.stdout.readline()
-            if output:
-                process_outputs[filename] = output.strip()
-                if any(keyword in output.lower() for keyword in ['error', 'exception', 'traceback', 'failed']):
-                    send(chat_id, f"📄 `{filename}`:\n```\n{output[-500:]}\n```")
-            
-            error_output = process.stderr.readline()
-            if error_output:
-                send(chat_id, f"❌ `{filename}` error:\n```\n{error_output[-500:]}\n```")
-                
-            time.sleep(0.1)
-    except:
-        pass
-
-def stop_file(filename):
-    try:
-        if filename in active_processes:
-            process = active_processes[filename]
-            file_status[filename]["status"] = "stopped"
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except:
-                process.kill()
-            del active_processes[filename]
-            return f"✅ Stopped `{filename}`"
-        else:
-            return "❌ File not running"
-    except Exception as e:
-        return f"❌ Stop error: `{str(e)}`"
-
-def list_files():
-    files = [f for f in os.listdir(UPLOAD_FOLDER) if f.endswith('.py')]
-    if not files:
-        return "📁 No files uploaded yet"
-    
-    result = "📁 **Uploaded Files:**\n\n"
-    for i, file in enumerate(files, 1):
-        status = "🟢 Running" if file in active_processes and active_processes[file].poll() is None else "🔴 Stopped"
-        restart_count = file_status.get(file, {}).get("restart_count", 0)
-        result += f"{i}. `{file}` - {status} (Restarts: {restart_count})\n"
-    
-    return result
-
-def install_library(lib_name):
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", lib_name],
-            capture_output=True,
-            text=True,
-            timeout=120
-        )
-        
-        if result.returncode == 0:
-            return f"✅ Installed `{lib_name}` successfully!\n\nOutput:\n```\n{result.stdout[-800:]}\n```"
-        else:
-            return f"❌ Failed to install `{lib_name}`\n\nError:\n```\n{result.stderr[-800:]}\n```"
-            
-    except subprocess.TimeoutExpired:
-        return f"⏰ Installation timeout for `{lib_name}`"
-    except Exception as e:
-        return f"❌ Installation error: `{str(e)}`"
-
-def handle_message(chat_id, text, pool):
-    if text == "📤 رفع ملف بايثون":
-        send(chat_id, "📤 **Upload Python File**\n\nSend a Python file (.py) now:\n• Auto-save\n• Auto-run with restart\n• Continuous monitoring")
-    
-    elif text == "📁 عرض الملفات":
-        files_info = list_files()
-        send(chat_id, files_info)
-        
-        files = [f for f in os.listdir(UPLOAD_FOLDER) if f.endswith('.py')]
-        for file in files:
-            status = "🟢 Running" if file in active_processes and active_processes[file].poll() is None else "🔴 Stopped"
-            keyboard = {
-                "inline_keyboard": [
-                    [
-                        {"text": "▶️ Run", "callback_data": f"run_{file}"},
-                        {"text": "⏹ Stop", "callback_data": f"stop_{file}"},
-                        {"text": "🔁 Restart", "callback_data": f"restart_{file}"}
-                    ],
-                    [
-                        {"text": "📊 Status", "callback_data": f"status_{file}"},
-                        {"text": "🗑 Delete", "callback_data": f"delete_{file}"}
-                    ]
-                ]
-            }
-            send(chat_id, f"📄 `{file}`\n📊 {status}", keyboard)
-    
-    elif text == "📦 تثبيت مكتبة":
-        send(chat_id, "📦 **Install Library**\n\nSend library name to install:\nExample: `requests` or `numpy pandas`\n\nOr use command:\n`/install library_name`")
-    
-    elif text == "🔄 تحديث":
-        send(chat_id, "🔄 **Menu Updated**", get_main_keyboard())
-    
-    elif text.startswith("/install "):
-        lib_name = text.replace("/install ", "").strip()
-        if lib_name:
-            send(chat_id, f"⏳ Installing `{lib_name}`...")
-            result = install_library(lib_name)
-            send(chat_id, result)
-        else:
-            send(chat_id, "❌ Please specify library name")
-    
-    else:
-        send(chat_id, "🚀 **Welcome to SIFO Advanced Bot!**\n\nChoose an option:", get_main_keyboard())
-
-def handle_update(upd, pool):
-    try:
-        if "message" in upd:
-            msg = upd["message"]
-            chat_id = msg.get("chat", {}).get("id")
-            text = msg.get("text", "")
-            
-            if text:
-                pool.submit(handle_message, chat_id, text, pool)
-        
-        if "message" in upd and "document" in upd["message"]:
-            doc = upd["message"]["document"]
-            chat_id = upd["message"]["chat"]["id"]
-            file_name = doc.get("file_name", "")
-            
-            if file_name.endswith('.py'):
-                file_id = doc["file_id"]
-                send(chat_id, f"⏳ Uploading `{file_name}`...")
-                
-                if download_file(file_id, file_name):
-                    send(chat_id, f"✅ Uploaded `{file_name}` successfully!\n⚡ Starting auto-run...")
-                    result = run_python_file(file_name, chat_id)
-                    send(chat_id, result)
-                else:
-                    send(chat_id, "❌ Upload failed")
-            else:
-                send(chat_id, "❌ Please upload Python files only (.py extension)")
-        
-        if "callback_query" in upd:
-            callback = upd["callback_query"]
-            chat_id = callback["message"]["chat"]["id"]
-            data = callback["data"]
-            
-            if data.startswith("run_"):
-                filename = data[4:]
-                send(chat_id, f"⚡ Starting `{filename}`...")
-                result = run_python_file(filename, chat_id)
-                send(chat_id, result)
-            
-            elif data.startswith("stop_"):
-                filename = data[5:]
-                result = stop_file(filename)
-                send(chat_id, result)
-            
-            elif data.startswith("restart_"):
-                filename = data[8:]
-                send(chat_id, f"🔁 Restarting `{filename}`...")
-                stop_file(filename)
-                time.sleep(2)
-                result = run_python_file(filename, chat_id)
-                send(chat_id, result)
-            
-            elif data.startswith("status_"):
-                filename = data[7:]
-                if filename in file_status:
-                    status = file_status[filename]
-                    uptime = time.time() - status["start_time"]
-                    status_text = f"📊 **File Status:** `{filename}`\n"
-                    status_text += f"🟢 **Status:** {status['status']}\n"
-                    status_text += f"⏱ **Uptime:** {int(uptime)} seconds\n"
-                    status_text += f"🔄 **Restarts:** {status['restart_count']}\n"
-                    if filename in active_processes:
-                        status_text += f"🆔 **PID:** {active_processes[filename].pid}"
-                    send(chat_id, status_text)
-                else:
-                    send(chat_id, f"❌ `{filename}` not running yet")
-            
-            elif data.startswith("delete_"):
-                filename = data[7:]
-                try:
-                    stop_file(filename)
-                    file_path = os.path.join(UPLOAD_FOLDER, filename)
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-                    if filename in file_status:
-                        del file_status[filename]
-                    send(chat_id, f"✅ Deleted `{filename}`")
-                except Exception as e:
-                    send(chat_id, f"❌ Delete error: `{str(e)}`")
-    
-    except Exception as e:
-        print(f"Update handling error: {e}")
-
-def main_loop():
-    pool = ThreadPoolExecutor(MAX_WORKERS)
-    offset = read_offset()
-    
-    print("🚀 Starting Advanced Python File Management Bot...")
-    print("⚡ Auto-restart feature enabled")
-    print("📁 Files folder:", UPLOAD_FOLDER)
-    
-    while True:
-        try:
-            params = {"timeout": LONG_POLL, "limit": 100}
-            if offset is not None:
-                params["offset"] = offset
-            full_url = GETUPDATES + "?" + parse.urlencode(params)
-            with request.urlopen(full_url, timeout=LONG_POLL+10) as resp:
-                data = json.loads(resp.read().decode())
-            updates = data.get("result", [])
-            
-            for upd in updates:
-                uid = upd.get("update_id")
-                if uid is not None:
-                    offset = uid + 1
-                    write_offset(offset)
-                threading.Thread(target=handle_update, args=(upd, pool), daemon=True).start()
-            
-            if not updates:
-                time.sleep(0.05)
-                
-        except Exception as e:
-            time.sleep(0.1)
-
-if __name__ == "__main__":
-    main_loop()
-'@
-
-          Set-Content -Path "C:\TelegramBot\bot.py" -Value $botScript -Encoding UTF8
-          Write-Host "✅ Bot script created successfully"
-
-      - name: Create Auto-Start Batch File
-        run: |
-          $batchContent = @'
-@echo off
-cd /d C:\TelegramBot
-echo Starting Telegram Bot...
-python bot.py
-pause
-'@
-
-          Set-Content -Path "C:\Users\Public\Desktop\Start Telegram Bot.bat" -Value $batchContent
-          Write-Host "✅ Auto-start batch file created on desktop"
-
-      - name: Start Telegram Bot
-        run: |
-          # Start the bot in background
-          Start-Process -FilePath "python" -ArgumentList "C:\TelegramBot\bot.py" -WindowStyle Hidden
-          Write-Host "✅ Telegram Bot started successfully in background"
-
-      - name: Get Public IP
-        run: |
-          try {
-              $publicIP = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10
-              echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
-              Write-Host "🌍 Public IP: $publicIP"
-          } catch {
-              Write-Host "⚠️ Could not get public IP"
-              echo "PUBLIC_IP=Unknown" >> $env:GITHUB_ENV
+          # تشغيل Tailscale مع إعدادات VPS
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=vps-server-20d --accept-routes --accept-dns --reset
+          
+          # الحصول على IP
+          $tsIP = $null
+          for ($i = 1; $i -le 25; $i++) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              if ($tsIP) {
+                  echo "VPS_IP=$tsIP" >> $env:GITHUB_ENV
+                  Write-Host "VPS IP Address: $tsIP"
+                  break
+              }
+              Write-Host "Waiting for VPS IP... ($i/25)"
+              Start-Sleep -Seconds 4
           }
-
-      - name: Display Final Information
-        run: |
-          Write-Host ""
-          Write-Host "🎯 ==================== RDP + TELEGRAM BOT READY ===================="
-          Write-Host "👤 Username: SIFODZ"
-          Write-Host "🔑 Password: P@ssw0rd123"
-          Write-Host "🌐 Public IP: $env:PUBLIC_IP"
-          Write-Host "🔌 RDP Port: 3389"
-          Write-Host ""
-          Write-Host "🤖 TELEGRAM BOT INFORMATION:"
-          Write-Host "   ✅ Bot is running automatically"
-          Write-Host "   🔗 Bot Token: 8407863189:AAFymLb1zhM4Gq2q7YSIKhV5M37K8eTunRk"
-          Write-Host "   📁 Bot Location: C:\TelegramBot"
-          Write-Host "   🖥️ Desktop Shortcut: 'Start Telegram Bot.bat'"
-          Write-Host ""
-          Write-Host "🔧 INSTALLED PACKAGES:"
-          Write-Host "   • requests, telethon, python-telegram-bot, pyrogram"
-          Write-Host "   • tweepy, beautifulsoup4, selenium, pillow"
-          Write-Host "   • numpy, pandas, opencv-python, flask"
-          Write-Host "   • django, fastapi, sqlalchemy, psutil, pyautogui"
-          Write-Host ""
-          Write-Host "🔧 HOW TO CONNECT:"
-          Write-Host "   1. Open Remote Desktop Connection (mstsc.exe)"
-          Write-Host "   2. Computer: $env:PUBLIC_IP:3389"
-          Write-Host "   3. Username: SIFODZ"
-          Write-Host "   4. Password: P@ssw0rd123"
-          Write-Host "   5. The bot is already running automatically"
-          Write-Host ""
-          Write-Host "⏰ Duration: 7 DAYS"
-          Write-Host "================================================================"
-          Write-Host ""
-
-      - name: Keep System Active
-        run: |
-          $startTime = Get-Date
-          Write-Host "🔄 System is running - RDP and Telegram Bot are active..."
           
-          while ($true) {
-              $currentTime = Get-Date
-              $elapsed = $currentTime - $startTime
-              $hours = [math]::Round($elapsed.TotalHours, 1)
-              
-              # Check RDP service
+          if (-not $tsIP) {
+              Write-Host "Using alternative method to get IP..."
               try {
-                  $rdpService = Get-Service -Name TermService -ErrorAction Stop
-                  if ($rdpService.Status -ne 'Running') {
-                      Write-Host "🔄 Restarting RDP Service..."
-                      Start-Service -Name TermService
+                  $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+                  $tsIP = $status.Self.TailscaleIPs[0]
+                  if ($tsIP) {
+                      echo "VPS_IP=$tsIP" >> $env:GITHUB_ENV
                   }
               } catch {
-                  Write-Host "⚠️ Could not check RDP service"
+                  Write-Host "Could not get IP, but continuing..."
               }
-              
-              # Check if bot is running
-              $botProcess = Get-Process -Name "python" -ErrorAction SilentlyContinue | Where-Object { 
-                  $_.MainModule.FileName -like "*python*" 
-              }
-              
-              if (-not $botProcess) {
-                  Write-Host "🔄 Restarting Telegram Bot..."
-                  Start-Process -FilePath "python" -ArgumentList "C:\TelegramBot\bot.py" -WindowStyle Hidden
-              }
-              
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ System Active - $hours hours - IP: $env:PUBLIC_IP"
-              Start-Sleep -Seconds 60
           }
+
+      - name: Configure VPS Services
+        run: |
+          Write-Host "Configuring VPS services..."
+          
+          # تعطيل الخدمات غير الضرورية للـ VPS
+          $servicesToDisable = @(
+              "XboxGipSvc",
+              "XboxNetApiSvc", 
+              "WSearch",
+              "TabletInputService",
+              "Fax",
+              "MapsBroker"
+          )
+          
+          foreach ($service in $servicesToDisable) {
+              Stop-Service -Name $service -Force -ErrorAction SilentlyContinue
+              Set-Service -Name $service -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+          
+          # تمكين الخدمات الهامة
+          $servicesToEnable = @(
+              "TermService",
+              "SessionEnv",
+              "UmRdpService"
+          )
+          
+          foreach ($service in $servicesToEnable) {
+              Set-Service -Name $service -StartupType Automatic -ErrorAction SilentlyContinue
+              Start-Service -Name $service -ErrorAction SilentlyContinue
+          }
+          
+          Write-Host "VPS services configured"
+
+      - name: Create VPS Maintenance Script
+        run: |
+          Write-Host "Creating VPS maintenance script..."
+          
+          $maintenanceScript = @'
+          # VPS Maintenance Script
+          `$logPath = "C:\vps-status.log"
+          `$startTime = Get-Date
+          `$endTime = `$startTime.AddDays(20)
+          
+          function Log-Message {
+              param([string]`$message)
+              `$timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              `$logEntry = "[`$timestamp] `$message"
+              Add-Content -Path `$logPath -Value `$logEntry
+              Write-Host `$logEntry
+          }
+          
+          Log-Message "VPS Server started - 20 days session"
+          
+          while ((Get-Date) -lt `$endTime) {
+              `$remaining = `$endTime - (Get-Date)
+              `$days = [math]::Round(`$remaining.TotalDays, 2)
+              
+              # التحقق من الخدمات الأساسية كل 10 دقائق
+              `$essentialServices = @("TermService", "SessionEnv")
+              foreach (`$service in `$essentialServices) {
+                  `$svc = Get-Service -Name `$service -ErrorAction SilentlyContinue
+                  if (`$svc.Status -ne "Running") {
+                      Log-Message "Service `$service is not running - restarting"
+                      Start-Service -Name `$service -Force
+                  }
+              }
+              
+              # التحقق من اتصال Tailscale كل 30 دقيقة
+              if ((Get-Date).Minute % 30 -eq 0) {
+                  try {
+                      `$currentIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+                      if (-not `$currentIP) {
+                          Log-Message "Tailscale disconnected - reconnecting"
+                          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --reset
+                      }
+                  } catch {
+                      Log-Message "Tailscale check failed: `$(`_.Exception.Message)"
+                  }
+              }
+              
+              # تسجيل الحالة كل ساعة
+              if ((Get-Date).Minute % 60 -eq 0) {
+                  Log-Message "VPS Active - `$days days remaining - IP: `$(`$currentIP)"
+              }
+              
+              Start-Sleep -Seconds 300
+          }
+          
+          Log-Message "VPS 20-day session completed successfully"
+'@
+          
+          Set-Content -Path "C:\vps-maintenance.ps1" -Value $maintenanceScript
+          Write-Host "VPS maintenance script created"
+
+      - name: Start VPS Server
+        run: |
+          Write-Host "Starting VPS Server..."
+          
+          # بدء سكريبت الصيانة
+          Start-Process PowerShell.exe -ArgumentList "-WindowStyle Hidden -File C:\vps-maintenance.ps1" -WindowStyle Hidden
+          
+          Write-Host ""
+          Write-Host "========================================================"
+          Write-Host "🎯 VPS SERVER READY - 20 DAYS"
+          Write-Host "========================================================"
+          Write-Host "🌐 IP Address: $env:VPS_IP"
+          Write-Host "👤 Username: $env:VPS_USER"
+          Write-Host "🔑 Password: $env:VPS_PASSWORD"
+          Write-Host ""
+          Write-Host "⏰ Duration: 20 DAYS"
+          Write-Host "🕐 Start: $(Get-Date)"
+          Write-Host "📅 End: $((Get-Date).AddDays(20))"
+          Write-Host ""
+          Write-Host "🔧 Features:"
+          Write-Host "  • Full Windows VPS"
+          Write-Host "  • Persistent Connection"
+          Write-Host "  • Static IP"
+          Write-Host "  • 24/7 Availability"
+          Write-Host "  • Auto Maintenance"
+          Write-Host "========================================================"
+          Write-Host ""
+
+      - name: Keep VPS Alive for 20 Days
+        run: |
+          $totalSeconds = 20 * 24 * 60 * 60  # 20 يوم بالثواني
+          $checkInterval = 300  # كل 5 دقائق
+          $totalChecks = $totalSeconds / $checkInterval
+          $checkCount = 0
+          
+          for ($i = 0; $i -lt $totalChecks; $i++) {
+              $currentTime = Get-Date
+              $elapsed = $currentTime - (Get-Date).AddDays(-20).AddSeconds($totalSeconds)
+              $remainingDays = 20 - [math]::Round($elapsed.TotalDays, 2)
+              
+              # عرض الحالة كل ساعة
+              if ($checkCount % 12 -eq 0) {
+                  Write-Host "[$(Get-Date)] VPS Server Active - $remainingDays days remaining"
+                  
+                  # التحقق من السجلات
+                  try {
+                      if (Test-Path "C:\vps-status.log") {
+                          $lastLog = Get-Content "C:\vps-status.log" -Tail 1 -ErrorAction SilentlyContinue
+                          if ($lastLog) {
+                              Write-Host "Last log: $lastLog"
+                          }
+                      }
+                  } catch {
+                      # تجاهل أخطاء القراءة
+                  }
+              }
+              
+              # فحص شامل كل 6 ساعات
+              if ($checkCount % 72 -eq 0) {
+                  Write-Host "Performing VPS health check..."
+                  
+                  # التحقق من الخدمات
+                  $services = @("TermService", "SessionEnv")
+                  foreach ($service in $services) {
+                      $svc = Get-Service -Name $service -ErrorAction SilentlyContinue
+                      if ($svc.Status -ne "Running") {
+                          Write-Host "Starting service: $service"
+                          Start-Service -Name $service -Force
+                      }
+                  }
+                  
+                  # التحقق من Tailscale
+                  try {
+                      $currentIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+                      if (-not $currentIP) {
+                          Write-Host "Reconnecting Tailscale..."
+                          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --reset
+                      } else {
+                          Write-Host "Tailscale IP: $currentIP"
+                      }
+                  } catch {
+                      Write-Host "Tailscale check error: $($_.Exception.Message)"
+                  }
+                  
+                  Write-Host "VPS health check completed"
+              }
+              
+              $checkCount++
+              Start-Sleep -Seconds $checkInterval
+          }
+          
+          Write-Host "========================================================"
+          Write-Host "✅ VPS 20-DAY SESSION COMPLETED"
+          Write-Host "🕐 Finished at: $(Get-Date)"
+          Write-Host "========================================================"
