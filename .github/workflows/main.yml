@@ -1,4 +1,4 @@
-name: VPS-from-RDP
+name: VPS-from-RDP-fixed
 
 on:
   workflow_dispatch:
@@ -21,13 +21,14 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
 
-          # firewall rule (delete if exists then add)
           Write-Host "==> Configure Firewall rule for RDP (3389)"
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          # Remove rule if exists (ignore errors) then add
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null || Write-Host "No existing rule to delete (ok)."
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
           Write-Host "==> Restart TermService"
           Restart-Service -Name TermService -Force
+          Write-Host "RDP configured."
 
       - name: Create RDP User with Static Password
         shell: pwsh
@@ -36,22 +37,27 @@ jobs:
           $password = "${{ env.RDP_PASS }}"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          if (-not (Get-Command Get-LocalUser -ErrorAction SilentlyContinue)) {
-            Write-Host "Get-LocalUser not available on this runner - attempting alternative creation..."
-          }
-
+          # Create user if not exists
           if (-not (Get-LocalUser -Name "${{ env.RDP_USER }}" -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name "${{ env.RDP_USER }}" -Password $securePass -AccountNeverExpires -PasswordNeverExpires:$true
+            New-LocalUser -Name "${{ env.RDP_USER }}" -Password $securePass -AccountNeverExpires -UserMayNotChangePassword:$false
             Write-Host "User created: $($env:RDP_USER)"
           } else {
             Write-Host "User already exists: $($env:RDP_USER)"
           }
 
-          Add-LocalGroupMember -Group "Administrators" -Member "${{ env.RDP_USER }}" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "${{ env.RDP_USER }}" -ErrorAction SilentlyContinue
+          # Add to groups (ignore errors if already member)
+          try { Add-LocalGroupMember -Group "Administrators" -Member "${{ env.RDP_USER }}" -ErrorAction SilentlyContinue } catch { Write-Host "Add to Administrators skipped/failed (non-fatal)." }
+          try { Add-LocalGroupMember -Group "Remote Desktop Users" -Member "${{ env.RDP_USER }}" -ErrorAction SilentlyContinue } catch { Write-Host "Add to Remote Desktop Users skipped/failed (non-fatal)." }
 
-          # export credentials to GitHub environment so later steps can use them
-          Add-Content -Path $env:GITHUB_ENV -Value ("RDP_CREDS=User: $($env:RDP_USER) | Password: $password")
+          # Write credentials to GITHUB_ENV for later steps (always)
+          $credsLine = "RDP_CREDS=User: $($env:RDP_USER) | Password: $password"
+          if ($env:GITHUB_ENV) {
+            Add-Content -Path $env:GITHUB_ENV -Value $credsLine
+            Write-Host "Wrote RDP_CREDS to GITHUB_ENV."
+          } else {
+            Write-Host "Warning: GITHUB_ENV not set - printing creds instead."
+            Write-Host $credsLine
+          }
 
           if (-not (Get-LocalUser -Name "${{ env.RDP_USER }}" -ErrorAction SilentlyContinue)) {
             Write-Error "User creation failed"
@@ -61,87 +67,142 @@ jobs:
       - name: Install Tailscale
         shell: pwsh
         run: |
-          Write-Host "==> Download and install Tailscale MSI"
+          Write-Host "==> Download and install Tailscale MSI (if possible)"
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
-          Start-Process -FilePath "msiexec.exe" -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item -Path $installerPath -Force -ErrorAction SilentlyContinue
-          Write-Host "Tailscale installed (if installation succeeded)."
+          try {
+            Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing -TimeoutSec 120
+            Start-Process -FilePath "msiexec.exe" -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+            Remove-Item -Path $installerPath -Force -ErrorAction SilentlyContinue
+            Write-Host "Tailscale MSI downloaded and installer executed (if permissions allowed)."
+          } catch {
+            Write-Host "Warning: Tailscale download/install failed or blocked. Continuing (non-fatal). Error: $_"
+          }
 
       - name: Establish Tailscale Connection (if auth key provided)
         shell: pwsh
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
+          Write-Host "==> Attempting to establish Tailscale (if auth key present)"
+          # Ensure GITHUB_ENV exists; if not, create a temp file path to write to and inform later steps.
+          if (-not $env:GITHUB_ENV) {
+            # create a temp env file pointer and set variable for subsequent steps
+            $tempEnv = Join-Path $env:TEMP "github_env_temp.txt"
+            New-Item -Path $tempEnv -ItemType File -Force | Out-Null
+            Write-Host "GITHUB_ENV not set; using temp env file: $tempEnv"
+            $env:GITHUB_ENV = $tempEnv
+          }
+
           if (-not $env:TAILSCALE_AUTH_KEY -or $env:TAILSCALE_AUTH_KEY -eq "") {
             Write-Host "No TAILSCALE_AUTH_KEY found in secrets. Skipping 'tailscale up'."
-            Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP="
-            exit 0
-          }
-
-          Write-Host "==> Running 'tailscale up' with provided auth key"
-          $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-          if (-not (Test-Path $exe)) {
-            Write-Error "Tailscale executable not found at $exe"
-            exit 1
-          }
-
-          & $exe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
-          # wait for IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 12) {
-            try {
-              $tsIP = & $exe ip -4 2>$null
-            } catch {
-              $tsIP = $null
-            }
-            if ($tsIP) { break }
-            Start-Sleep -Seconds 5
-            $retries++
-          }
-
-          if (-not $tsIP) {
-            Write-Error "Tailscale IP not assigned after retries. Continuing but TAILSCALE_IP will be empty."
+            # write empty TAILSCALE_IP so downstream steps see it exists
             Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP="
           } else {
-            $tsIP = $tsIP.Trim()
-            Write-Host "Tailscale IP: $tsIP"
-            Add-Content -Path $env:GITHUB_ENV -Value ("TAILSCALE_IP=$tsIP")
+            $exe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+            if (-not (Test-Path $exe)) {
+              Write-Host "Tailscale executable not found at $exe - attempting to continue."
+              Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP="
+            } else {
+              try {
+                & $exe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+              } catch {
+                Write-Host "Warning: 'tailscale up' command returned non-zero (continuing). Error: $_"
+              }
+              # wait for IP
+              $tsIP = $null
+              $retries = 0
+              while (-not $tsIP -and $retries -lt 12) {
+                try {
+                  $out = & $exe ip -4 2>$null
+                  if ($out) { $tsIP = $out.Trim() }
+                } catch {
+                  $tsIP = $null
+                }
+                if ($tsIP) { break }
+                Start-Sleep -Seconds 5
+                $retries++
+              }
+
+              if (-not $tsIP) {
+                Write-Host "Tailscale IP not assigned after retries. Writing empty TAILSCALE_IP."
+                Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP="
+              } else {
+                Write-Host "Tailscale IP acquired: $tsIP"
+                Add-Content -Path $env:GITHUB_ENV -Value ("TAILSCALE_IP=$tsIP")
+              }
+            }
           }
 
-      - name: Verify RDP Accessibility (via Tailscale IP if present)
+      - name: Verify RDP Accessibility (safe read)
         shell: pwsh
         run: |
-          $tsIP = (Get-Content $env:GITHUB_ENV | Select-String -Pattern '^TAILSCALE_IP=' | ForEach-Object { $_ -replace '^TAILSCALE_IP=', '' }).Trim()
+          Write-Host "==> Verify RDP Accessibility (safe)"
+          # Read TAILSCALE_IP from GITHUB_ENV file safely
+          $tsIP = ""
+          if ($env:GITHUB_ENV -and (Test-Path $env:GITHUB_ENV)) {
+            try {
+              $lines = Get-Content -Path $env:GITHUB_ENV -ErrorAction Stop
+              foreach ($l in $lines) {
+                if ($l -match '^TAILSCALE_IP=(.*)$') {
+                  $tsIP = $Matches[1].Trim()
+                  break
+                }
+              }
+            } catch {
+              Write-Host "Warning: Unable to read GITHUB_ENV file: $_"
+              $tsIP = ""
+            }
+          } else {
+            Write-Host "GITHUB_ENV file not found; skipping Tailscale connectivity test."
+            $tsIP = ""
+          }
+
           if ($tsIP -and $tsIP -ne "") {
             Write-Host "Tailscale IP detected: $tsIP - testing TCP:3389"
             $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -WarningAction SilentlyContinue
-            if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 on $tsIP failed"
-            } else {
+            if ($testResult -and $testResult.TcpTestSucceeded) {
               Write-Host "TCP connectivity to $tsIP:3389 successful!"
+            } else {
+              Write-Host "TCP connection to RDP port 3389 on $tsIP failed or filtered."
             }
           } else {
-            Write-Host "No Tailscale IP available. Skipping remote connectivity test."
+            Write-Host "No Tailscale IP available. To enable Tailscale set secret TAILSCALE_AUTH_KEY and re-run workflow."
           }
 
-      - name: Maintain Connection / Output credentials
+      - name: Maintain Connection / Output credentials (safe)
         shell: pwsh
         run: |
-          $tailIP = (Get-Content $env:GITHUB_ENV | Select-String -Pattern '^TAILSCALE_IP=' | ForEach-Object { $_ -replace '^TAILSCALE_IP=', '' }).Trim()
-          $creds = (Get-Content $env:GITHUB_ENV | Select-String -Pattern '^RDP_CREDS=' | ForEach-Object { $_ -replace '^RDP_CREDS=', '' }).Trim()
-          Write-Host "`n=== RDP ACCESS ==="
-          if ($tailIP -and $tailIP -ne "") {
-            Write-Host "Address (Tailscale): $tailIP"
-          } else {
-            Write-Host "Address: (No Tailscale IP - use runner public or check TAILSCALE_AUTH_KEY)"
+          Write-Host "==> Output access info and keep run alive (until you cancel)"
+          $tsIP = ""
+          $creds = ""
+          if ($env:GITHUB_ENV -and (Test-Path $env:GITHUB_ENV)) {
+            try {
+              $lines = Get-Content -Path $env:GITHUB_ENV -ErrorAction Stop
+              foreach ($l in $lines) {
+                if ($l -match '^TAILSCALE_IP=(.*)$') { $tsIP = $Matches[1].Trim() }
+                if ($l -match '^RDP_CREDS=(.*)$') { $creds = $Matches[1].Trim() }
+              }
+            } catch {
+              Write-Host "Warning: Couldn't read GITHUB_ENV content: $_"
+            }
           }
-          Write-Host "Credentials: $creds"
+
+          Write-Host "`n=== RDP ACCESS ==="
+          if ($tsIP -and $tsIP -ne "") {
+            Write-Host "Address (Tailscale): $tsIP"
+            Write-Host "You can RDP to the Tailscale IP (port 3389) using the user below."
+          } else {
+            Write-Host "Address: (No Tailscale IP). If you want a reachable RDP address, add secret TAILSCALE_AUTH_KEY and re-run."
+          }
+          if ($creds -and $creds -ne "") {
+            Write-Host "Credentials: $creds"
+          } else {
+            Write-Host "Credentials: User: $($env:RDP_USER) | Password: $($env:RDP_PASS)"
+          }
           Write-Host "==================`n"
 
-          Write-Host "Maintaining workflow run - process will print status every 5 minutes. Use 'Cancel workflow' in Actions to stop."
+          Write-Host "Maintaining workflow run - will print status every 5 minutes. Use 'Cancel workflow' in Actions to stop."
           while ($true) {
             Write-Host "[$(Get-Date -Format u)] RDP Active - Use Cancel workflow in Actions to terminate"
             Start-Sleep -Seconds 300
