@@ -1,193 +1,36 @@
-name: VPS
+name: VPS Free Ubuntu by SIFO
 
-on:
+on: 
   workflow_dispatch:
 
 jobs:
-  vps:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 3600
-
-    env:
-      DROPLET_NAME: vps-${{ github.run_id }}
-      USERNAME: TOOLBOXLAP
-      PASSWORD: "admin@123"
-      REGION: ams3
-      SIZE: s-1vcpu-1gb
-      IMAGE: ubuntu-24-04-x64
-
+    timeout-minutes: 60
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-
-    - name: Install dependencies
+    - name: Start VPS on Ubuntu ☁️
       run: |
-        sudo apt-get update -y
-        sudo apt-get install -y jq curl python3 python3-pip openssh-client sshpass
-        pip3 install requests
-
-    - name: Build cloud-init user-data
-      id: userdata
-      run: |
-        cat > user-data.yaml <<'EOF'
-        #cloud-config
-        preserve_hostname: false
-        hostname: ${DROPLET_NAME}
-        users:
-          - name: ${USERNAME}
-            gecos: "Toolbox User"
-            lock_passwd: false
-            plain_text_passwd: "${PASSWORD}"
-            sudo: ALL=(ALL) NOPASSWD:ALL
-            groups: [sudo]
-            shell: /bin/bash
-        ssh_pwauth: true
-        disable_root: false
-        packages:
-          - htop
-          - curl
-          - wget
-          - git
-          - python3
-          - python3-pip
-        runcmd:
-          - [ sh, -c, 'echo "SSH setup completed" ]
-        EOF
-
-        echo "user-data.yaml created."
-        UD_B64=$(base64 -w0 user-data.yaml)
-        echo "ud_b64=$UD_B64" >> $GITHUB_OUTPUT
-
-    - name: Create Droplet on DigitalOcean
-      id: create
-      env:
-        DO_TOKEN: ${{ secrets.DO_TOKEN }}
-      run: |
-        if [ -z "$DO_TOKEN" ]; then
-          echo "❌ ERROR: DO_TOKEN secret is missing."
-          exit 1
-        fi
-
-        UD_B64=${{ steps.userdata.outputs.ud_b64 }}
-        JSON_PAYLOAD=$(cat <<EOF
-        {
-          "name":"${DROPLET_NAME}",
-          "region":"${REGION}",
-          "size":"${SIZE}",
-          "image":"${IMAGE}",
-          "backups":false,
-          "ipv6":false,
-          "user_data":"$(base64 --decode <<< "$UD_B64")",
-          "tags":["github-actions","auto-vps"]
-        }
-        EOF
-        )
-
-        echo "Creating droplet..."
-        create_response=$(curl -s -X POST "https://api.digitalocean.com/v2/droplets" \
-          -H "Content-Type: application/json" \
-          -H "Authorization: Bearer $DO_TOKEN" \
-          -d "$JSON_PAYLOAD")
-
-        echo "$create_response" > create_response.json
-        droplet_id=$(jq -r '.droplet.id // empty' create_response.json)
-        if [ -z "$droplet_id" ]; then
-          echo "❌ Droplet creation failed."
-          jq . create_response.json
-          exit 1
-        fi
-
-        echo "✅ Droplet ID: $droplet_id"
-        echo "droplet_id=$droplet_id" >> $GITHUB_OUTPUT
-
-    - name: Wait for Droplet to be active
-      id: droplet-info
-      env:
-        DO_TOKEN: ${{ secrets.DO_TOKEN }}
-      run: |
-        droplet_id=${{ steps.create.outputs.droplet_id }}
-        echo "Waiting for droplet $droplet_id..."
-        for i in {1..60}; do
-          resp=$(curl -s -H "Authorization: Bearer $DO_TOKEN" "https://api.digitalocean.com/v2/droplets/$droplet_id")
-          status=$(echo "$resp" | jq -r '.droplet.status // empty')
-          echo "Attempt $i - status: $status"
-          if [ "$status" = "active" ]; then
-            pub_ip=$(echo "$resp" | jq -r '.droplet.networks.v4[] | select(.type=="public") | .ip_address' | head -n1)
-            if [ -n "$pub_ip" ]; then
-              echo "✅ Droplet IP: $pub_ip"
-              echo "public_ip=$pub_ip" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-          fi
-          sleep 5
-        done
-        echo "❌ Droplet not ready after waiting."
-        exit 1
-
-    - name: Wait for SSH port open
-      run: |
-        IP=${{ steps.droplet-info.outputs.public_ip }}
-        echo "Waiting SSH on $IP ..."
-        for i in {1..40}; do
-          nc -z -w5 $IP 22 && { echo "✅ SSH open"; exit 0; } || echo "SSH not ready ($i)"
-          sleep 5
-        done
-        echo "❌ SSH timeout."
-        exit 1
-
-    - name: Send credentials via email
-      env:
-        SMTP_HOST: ${{ secrets.SMTP_HOST }}
-        SMTP_PORT: ${{ secrets.SMTP_PORT }}
-        SMTP_USER: ${{ secrets.SMTP_USER }}
-        SMTP_PASS: ${{ secrets.SMTP_PASS }}
-        EMAIL_TO: ${{ secrets.EMAIL_TO }}
-        IP: ${{ steps.droplet-info.outputs.public_ip }}
-        USERNAME: ${{ env.USERNAME }}
-        PASSWORD: ${{ env.PASSWORD }}
-      run: |
-        python3 - <<PY
-import smtplib, os
-from email.message import EmailMessage
-
-smtp_host=os.environ['SMTP_HOST']
-smtp_port=int(os.environ.get('SMTP_PORT') or 587)
-smtp_user=os.environ['SMTP_USER']
-smtp_pass=os.environ['SMTP_PASS']
-to_addr=os.environ['EMAIL_TO']
-ip=os.environ['IP']
-user=os.environ['USERNAME']
-passwd=os.environ['PASSWORD']
-
-msg = EmailMessage()
-msg['Subject'] = f'VPS ACCESS - {ip}'
-msg['From'] = smtp_user
-msg['To'] = to_addr
-msg.set_content(f"""
-✅ تم إنشاء VPS بنجاح.
-
-🔹 العنوان (IP): {ip}
-🔹 المستخدم: {user}
-🔹 كلمة المرور: {passwd}
-
-ادخل من Termux أو أي SSH Client:
-ssh {user}@{ip}
-""")
-
-with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
-    s.starttls()
-    s.login(smtp_user, smtp_pass)
-    s.send_message(msg)
-print("📧 Email sent successfully to", to_addr)
-PY
-
-    - name: Show VPS Access Info
-      run: |
-        echo "======================"
-        echo "✅ VPS Created Successfully!"
-        echo "IP: ${{ steps.droplet-info.outputs.public_ip }}"
-        echo "User: ${{ env.USERNAME }}"
-        echo "Password: ${{ env.PASSWORD }}"
-        echo "To connect via Termux:"
-        echo "ssh ${{ env.USERNAME }}@${{ steps.droplet-info.outputs.public_ip }}"
-        echo "======================"
+        echo "✅ VPS Ubuntu started successfully!"
+        sudo apt update -y
+        sudo apt install -y openssh-server curl
+        sudo systemctl enable ssh
+        sudo systemctl start ssh
+        echo "root:123456" | sudo chpasswd
+        echo "💻 Username: root"
+        echo "🔑 Password: 123456"
+        echo "🌍 Connecting to Serveo..."
+        ssh -o StrictHostKeyChecking=no -R 2222:localhost:22 serveo.net &
+        echo "🌐 Waiting for Serveo connection..."
+        sleep 8
+        echo ""
+        echo "✅ VPS is ready!"
+        echo "---------------------------------------"
+        echo "Use this command in Termux or Linux:"
+        echo ""
+        echo "ssh root@serveo.net -p 2222"
+        echo "Password: 123456"
+        echo "---------------------------------------"
+        echo "🕐 VPS will stay online for ~60 minutes"
+        echo ""
+        sleep 3540
+        echo "⏰ VPS session ended. Bye!"
