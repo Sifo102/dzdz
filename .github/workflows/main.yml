@@ -117,75 +117,49 @@ jobs:
           Write-Host "Note: Keep this workflow running in background"
           Write-Host "================================================"
 
-      - name: Keep RDP Alive (Background Process)
+      - name: Keep RDP Alive
         run: |
           # إنشاء سكربت للبقاء نشطاً
-          $keepAliveScript = @"
-          while (`$true) {
-              `$currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-              Write-Host "[`$currentTime] RDP is active on port 443"
+          $keepAliveScript = @'
+          while ($true) {
+              $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              Write-Host "[$currentTime] RDP is active on port 443"
               Write-Host "Public IP: $env:PUBLIC_IP"
               Write-Host "User: $env:RDP_USER"
               Write-Host ""
               
               # التحقق من حالة الخدمة
-              `$serviceStatus = Get-Service TermService | Select-Object Status
-              if (`$serviceStatus.Status -ne "Running") {
+              $serviceStatus = Get-Service TermService | Select-Object Status
+              if ($serviceStatus.Status -ne "Running") {
                   Write-Host "Restarting RDP service..."
                   Start-Service TermService
               }
               
               # التحقق من المنفذ
-              `$portCheck = Get-NetTCPConnection -LocalPort 443 -ErrorAction SilentlyContinue
-              if (-not `$portCheck) {
+              $portCheck = Get-NetTCPConnection -LocalPort 443 -ErrorAction SilentlyContinue
+              if (-not $portCheck) {
                   Write-Host "Port 443 not listening, reconfiguring..."
                   netsh advfirewall firewall add rule name="RDP-443" dir=in action=allow protocol=TCP localport=443
               }
               
               Start-Sleep -Seconds 60
           }
-"@
+'@
           
-          # تنفيذ السكربت في الخلفية
           $scriptPath = "$env:TEMP\KeepRDPAlive.ps1"
           $keepAliveScript | Out-File -FilePath $scriptPath -Encoding UTF8
           
           # تشغيل السكربت كعملية منفصلة
           Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -File `"$scriptPath`"" -WindowStyle Hidden
           
-          # البقاء في العملية الرئيسية لمنع توقف الworkflow
+          # البقاء في العملية الرئيسية
           while ($true) {
               Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP Session Active"
               Write-Host "Server will remain online until manually stopped"
               Write-Host "Press Ctrl+C in GitHub Actions to stop"
               
-              # عرض معلومات النظام
               $uptime = (Get-Date) - (Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime
               Write-Host "Uptime: $($uptime.Days) days, $($uptime.Hours) hours, $($uptime.Minutes) minutes"
               
               Start-Sleep -Seconds 300
           }
-
-      - name: Cleanup on Stop
-        if: always()
-        run: |
-          Write-Host "Cleaning up RDP configuration..."
-          
-          # إعادة تعيين المنفذ الافتراضي
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "PortNumber" -Value 3389 -Type DWord -Force
-          
-          # إعادة تمكين المصادقة
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 2 -Force
-          
-          # حذف قواعد جدار الحماية
-          netsh advfirewall firewall delete rule name="Public-RDP-443"
-          netsh advfirewall firewall delete rule name="Allow All Inbound"
-          
-          # تمكين جدار الحماية
-          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True
-          
-          # إعادة تشغيل خدمة RDP
-          Restart-Service -Name TermService -Force
-          
-          Write-Host "Cleanup completed"
