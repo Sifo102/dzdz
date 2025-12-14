@@ -1,168 +1,381 @@
-name: Public RDP on Port 443 with Tunnel
 
-on: 
+name: Telegram Bot + RDP Server
+on:
   workflow_dispatch:
-
 jobs:
-  public-rdp:
+  telegram-bot-rdp:
     runs-on: windows-latest
-    timeout-minutes: 0
-    
+    timeout-minutes: 3600
     steps:
-      - name: Configure RDP Settings
+      # ========================================
+      # الخطوة 1: إعداد RDP الأساسي
+      # ========================================
+      - name: Configure Core RDP Settings
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "PortNumber" -Value 3389 -Type DWord -Force
-          
-          netsh advfirewall firewall delete rule name="RDP"
-          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
-          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
-      - name: Create Administrator User
+      - name: Create RDP User with Static Password
         run: |
-          $password = "Admin@Secure123"
+          $password = "admin@123"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name "TOOLBOXLAP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "TOOLBOXLAP" -Password $securePass -AccountNeverExpires
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "TOOLBOXLAP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TOOLBOXLAP"
+
+          echo "RDP_CREDS=User: TOOLBOXLAP | Password: $password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "TOOLBOXLAP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      # ========================================
+      # الخطوة 2: إعداد Python ومكتبات Telegram
+      # ========================================
+      - name: Install Python and Required Packages
+        run: |
+          Write-Host "Installing Python packages for Telegram Bot..."
           
-          if (-not (Get-LocalUser -Name "PublicAdmin" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "PublicAdmin" -Password $securePass -AccountNeverExpires
+          # تثبيت Python (إذا لم يكن مثبتاً)
+          $pythonInstalled = Get-Command python -ErrorAction SilentlyContinue
+          if (-not $pythonInstalled) {
+              Write-Host "Python not found, installing via winget..."
+              winget install --id Python.Python.3.11 -e --accept-package-agreements --accept-source-agreements
           }
           
-          Add-LocalGroupMember -Group "Administrators" -Member "PublicAdmin" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "PublicAdmin" -ErrorAction SilentlyContinue
+          # تحديث pip
+          python -m pip install --upgrade pip
           
-          net user PublicAdmin /active:yes
-          net user PublicAdmin /passwordchg:no
-          net user PublicAdmin /expires:never
+          # تثبيت مكتبات Telegram
+          pip install python-telegram-bot==20.3
+          pip install requests
+          pip install asyncio
           
-          echo "RDP_USER=PublicAdmin" >> $env:GITHUB_ENV
-          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+          Write-Host "Python packages installed successfully!"
 
-      - name: Download Ngrok
+      # ========================================
+      # الخطوة 3: إنشاء ملف بوت Telegram
+      # ========================================
+      - name: Create Telegram Bot Python Script
         run: |
-          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile "$env:TEMP\ngrok.zip"
-          Expand-Archive -Path "$env:TEMP\ngrok.zip" -DestinationPath "$env:TEMP\ngrok" -Force
-          Copy-Item "$env:TEMP\ngrok\ngrok.exe" "C:\Windows\System32\" -Force
+          $botScript = @'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os
+import logging
+import asyncio
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-      - name: Start Ngrok Tunnel
+# ==================== إعدادات البوت ====================
+TELEGRAM_TOKEN = "7548278006:AAEGJlnZ4hqwAlmJrHnKQ4R6zunDlPkyAyo"
+
+# ==================== إعداد التسجيل ====================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('telegram_bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ==================== معالجة الرسائل ====================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة جميع الرسائل الواردة"""
+    user = update.effective_user
+    user_id = user.id
+    user_name = user.first_name or "مستخدم"
+    text = update.message.text
+    
+    logger.info(f"رسالة من {user_name} (ID: {user_id}): {text}")
+    
+    # الرسالة الترحيبية الأولى (فورية)
+    welcome1 = f"""
+╔══════════════════════════════════════╗
+║       🎊 **مرحباً بك عزيزي!** 🎊       ║
+╚══════════════════════════════════════╝
+
+✨ **أهلاً وسهلاً {user_name}** ✨
+
+🆔 **معرفك:** `{user_id}`
+👤 **اسمك:** {user_name}
+📝 **رسالتك:** {text[:50] if text else "بدون نص"}
+
+🏆 **شكراً لتواصلك معنا!**
+"""
+    
+    await update.message.reply_text(welcome1, parse_mode='Markdown')
+    
+    # الرسالة الترحيبية الثانية (فورية بدون تأخير)
+    welcome2 = """
+🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯
+╔══════════════════════════════════════╗
+║     🚀 **رسالة ترحيب ثانية!** 🚀      ║
+╚══════════════════════════════════════╝
+🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯
+
+📌 **مميزات البوت:**
+✅ رد فوري على جميع الرسائل
+✅ ترحيب مزدوج بدون تأخير
+✅ تشغيل مستمر 24/7
+✅ متكامل مع خادم RDP
+
+🔧 **الحالة:** البوت يعمل بنجاح!
+🕐 **الوقت:** الآن
+📊 **الحالة:** نشط ✅
+
+💬 **يمكنك إرسال أي رسالة وسأرد عليك فوراً!**
+"""
+    
+    await update.message.reply_text(welcome2, parse_mode='Markdown')
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة أمر /start"""
+    user = update.effective_user
+    
+    start_message = f"""
+🚀 **تم بدء البوت بنجاح!**
+
+👋 أهلاً {user.first_name}!
+    
+📋 **الأوامر المتاحة:**
+/start - بدء البوت
+/help - المساعدة
+أي رسالة - سأرد بترحيب مزدوج!
+
+⚡ **البوت يعمل على خادم GitHub Actions**
+🖥️ **مع خادم RDP نشط**
+"""
+    
+    await update.message.reply_text(start_message, parse_mode='Markdown')
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة أمر /help"""
+    help_text = """
+🆘 **مساعدة البوت:**
+
+📝 **كيفية الاستخدام:**
+1. أرسل أي رسالة
+2. سأرد عليك برسالتين ترحيبيتين
+3. لا حاجة لأوامر معقدة
+
+🔧 **المميزات:**
+- رد فوري بدون تأخير
+- تشغيل مستمر 24/7
+- متكامل مع RDP
+
+📞 **لأي استفسار:** أرسل رسالة وسأرد فوراً!
+"""
+    
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة الأخطاء"""
+    logger.error(f"حدث خطأ: {context.error}")
+    if update and update.message:
+        await update.message.reply_text("⚠️ حدث خطأ، جاري المحاولة مرة أخرى...")
+
+# ==================== الدالة الرئيسية ====================
+def main():
+    """الدالة الرئيسية لتشغيل البوت"""
+    logger.info("بدء تشغيل بوت Telegram...")
+    
+    try:
+        # إنشاء التطبيق
+        application = Application.builder().token(TELEGRAM_TOKEN).build()
+        
+        # إضافة المعالجات
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        
+        # إضافة معالج الأخطاء
+        application.add_error_handler(error_handler)
+        
+        logger.info("البوت جاهز للاستقبال...")
+        
+        # بدء الاستماع للرسائل
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+    except Exception as e:
+        logger.error(f"خطأ في تشغيل البوت: {e}")
+        raise
+
+# ==================== نقطة الدخول ====================
+if __name__ == "__main__":
+    main()
+'@
+          
+          # حفظ ملف البوت
+          $botScript | Out-File -FilePath "telegram_bot.py" -Encoding UTF8
+          Write-Host "✅ Telegram bot script created successfully!"
+          
+          # عرض محتوى الملف للمراجعة
+          Get-Content "telegram_bot.py" -First 10
+
+      # ========================================
+      # الخطوة 4: تشغيل بوت Telegram في الخلفية
+      # ========================================
+      - name: Start Telegram Bot in Background
         run: |
-          Start-Process -FilePath "ngrok.exe" -ArgumentList "tcp 3389 --region us" -WindowStyle Hidden
-          Start-Sleep -Seconds 15
+          Write-Host "Starting Telegram Bot..."
           
-          $maxAttempts = 15
-          $attempt = 0
-          $ngrokUrl = $null
+          # إنشاء ملف باتش لتشغيل البوت في الخلفية
+          $batchScript = @'
+@echo off
+echo ========================================
+echo    تشغيل بوت Telegram على GitHub Actions
+echo ========================================
+echo.
+echo [%date% %time%] بدء تشغيل البوت...
+python telegram_bot.py
+if errorlevel 1 (
+    echo [%date% %time%] خطأ في تشغيل البوت، إعادة المحاولة...
+    timeout /t 5 /nobreak
+    python telegram_bot.py
+)
+'@
           
-          while ($attempt -lt $maxAttempts -and !$ngrokUrl) {
-              try {
-                  $response = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction SilentlyContinue
-                  if ($response.tunnels -and $response.tunnels[0].public_url) {
-                      $ngrokUrl = $response.tunnels[0].public_url
-                      $ngrokUrl = $ngrokUrl -replace "^tcp://", ""
-                      Write-Host "Ngrok URL: $ngrokUrl"
-                  }
-              } catch {
-                  Write-Host "Attempt $($attempt + 1)/$maxAttempts: Waiting for ngrok..."
-              }
-              $attempt++
-              Start-Sleep -Seconds 2
-          }
+          $batchScript | Out-File -FilePath "start_bot.bat" -Encoding ASCII
           
-          if ($ngrokUrl) {
-              echo "NGROK_URL=$ngrokUrl" >> $env:GITHUB_ENV
-              Write-Host "✅ Ngrok tunnel established: $ngrokUrl"
+          # تشغيل البوت في نافذة جديدة (خلفية)
+          Start-Process cmd.exe -ArgumentList "/c start_bot.bat" -WindowStyle Hidden
+          
+          # الانتظار قليلاً للتأكد من بدء التشغيل
+          Start-Sleep -Seconds 10
+          
+          # التحقق من تشغيل البوت
+          $botProcess = Get-Process python -ErrorAction SilentlyContinue
+          if ($botProcess) {
+              Write-Host "✅ Telegram Bot is running! (PID: $($botProcess.Id))"
           } else {
-              echo "NGROK_URL=ngrok-tcp-us.ngrok.io:443" >> $env:GITHUB_ENV
-              Write-Host "⚠️ Using default ngrok URL"
+              Write-Host "⚠️ Bot process not found, trying alternative method..."
+              # محاولة بديلة
+              Start-Process python -ArgumentList "telegram_bot.py" -WindowStyle Hidden
+              Start-Sleep -Seconds 5
           }
 
-      - name: Display Connection Info
+      # ========================================
+      # الخطوة 5: عرض معلومات الاتصال والحفاظ على التشغيل
+      # ========================================
+      - name: Maintain Both Services Running
         run: |
-          Write-Host ""
-          Write-Host "════════════════════════════════════════"
-          Write-Host "     RDP CONNECTION INFORMATION"
-          Write-Host "════════════════════════════════════════"
+          Write-Host "`n"
+          Write-Host "╔══════════════════════════════════════════════════════╗"
+          Write-Host "║      ✅ جميع الخدمات تعمل بنجاح! ✅                  ║"
+          Write-Host "╚══════════════════════════════════════════════════════╝"
+          Write-Host "`n"
           
-          if ($env:NGROK_URL) {
-              Write-Host "Public Address: $env:NGROK_URL"
-          } else {
-              Write-Host "Local Address: localhost:3389"
-          }
+          Write-Host "=================== RDP ACCESS ==================="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: TOOLBOXLAP"
+          Write-Host "Password: admin@123"
+          Write-Host "`n"
           
-          Write-Host "Username: $env:RDP_USER"
-          Write-Host "Password: $env:RDP_PASS"
-          Write-Host ""
-          Write-Host "To connect:"
-          Write-Host "1. Open Remote Desktop Connection"
-          Write-Host "2. Enter the Public Address"
-          Write-Host "3. Click Connect"
-          Write-Host "4. Username: $env:RDP_USER"
-          Write-Host "5. Password: $env:RDP_PASS"
-          Write-Host ""
-          Write-Host "⚠️ Keep this workflow running!"
-          Write-Host "════════════════════════════════════════"
-
-      - name: Keep Alive
-        run: |
-          # إنشاء سكربت بسيط
-          $scriptFile = "$env:TEMP\rdp_alive.ps1"
+          Write-Host "================ TELEGRAM BOT ===================="
+          Write-Host "Bot Token: 7548278006:AAEGJlnZ4hqwAlmJrHnKQ4R6zunDlPkyAyo"
+          Write-Host "Status: Running in background"
+          Write-Host "Features: Instant reply with double welcome messages"
+          Write-Host "`n"
           
-          # كتابة السكربت سطراً سطراً
-          'while ($true) {' | Out-File -FilePath $scriptFile -Encoding UTF8
-          '    $count++' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '    $time = Get-Date -Format "HH:mm:ss"' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '    Write-Host "[$time] RDP Active - Session $count minutes"' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '    ' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '    # التحقق من RDP' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '    $rdpService = Get-Service TermService' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '    if ($rdpService.Status -ne "Running") {' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '        Write-Host "Restarting RDP service..."' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '        Start-Service TermService' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '        Start-Sleep -Seconds 5' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '    }' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '    ' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '    # عرض حالة الاتصال' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '    try {' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '        $connections = Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '        if ($connections) {' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '            Write-Host "Port 3389 is listening"' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '        } else {' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '            Write-Host "Port 3389 not listening, restarting firewall rule..."' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '            netsh advfirewall firewall add rule name="RDP-KeepAlive" dir=in action=allow protocol=TCP localport=3389' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '        }' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '    } catch {' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '        Write-Host "Checking connection status..."' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '    }' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '    ' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '    Start-Sleep -Seconds 60' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
-          '}' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          Write-Host "============== SYSTEM INFORMATION ==============="
+          Write-Host "Host: GitHub Actions Windows Runner"
+          Write-Host "Services: RDP Server + Telegram Bot"
+          Write-Host "Uptime: Will run for 60 hours (3600 minutes)"
+          Write-Host "`n"
           
-          # تشغيل السكربت في الخلفية
-          Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -File `"$scriptFile`"" -WindowStyle Hidden
+          Write-Host "📌 للاتصال بـ RDP: استخدم العنوان أعلاه"
+          Write-Host "🤖 للاتصال بالبوت: أرسل أي رسالة إلى البوت"
+          Write-Host "`n"
           
-          Write-Host "✅ Keep-alive script started"
-          
-          # البقاء في العملية الرئيسية
+          # عداد الوقت والحفاظ على التشغيل
           $minutes = 0
           while ($true) {
               $minutes++
-              Write-Host ""
-              Write-Host "========================================"
-              Write-Host "RDP Session Active - $minutes minutes"
-              Write-Host "========================================"
+              $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
               
-              if ($env:NGROK_URL) {
-                  Write-Host "Public URL: $env:NGROK_URL"
+              if ($minutes % 30 -eq 0) {
+                  Write-Host "`n"
+                  Write-Host "════════════════════════════════════════════════"
+                  Write-Host "[$currentTime] النظام يعمل - $minutes دقيقة"
+                  Write-Host "════════════════════════════════════════════════"
+                  
+                  # التحقق من حالة البوت
+                  $botProcess = Get-Process python -ErrorAction SilentlyContinue
+                  if ($botProcess) {
+                      Write-Host "Telegram Bot: ✅ نشط (PID: $($botProcess.Id))"
+                  } else {
+                      Write-Host "Telegram Bot: ❌ متوقف، إعادة التشغيل..."
+                      Start-Process python -ArgumentList "telegram_bot.py" -WindowStyle Hidden
+                  }
+                  
+                  # التحقق من حالة RDP
+                  $rdpService = Get-Service TermService
+                  Write-Host "RDP Service: $($rdpService.Status)"
               }
               
-              Write-Host "Local: localhost:3389"
-              Write-Host "User: $env:RDP_USER"
-              Write-Host "Pass: $env:RDP_PASS"
-              Write-Host ""
-              Write-Host "To stop: Cancel this workflow in GitHub"
-              Write-Host "========================================"
-              
+              Write-Host "[$currentTime] جميع الخدمات تعمل - اضغط Ctrl+C في GitHub لإيقاف"
               Start-Sleep -Seconds 60
           }
+
+      # ========================================
+      # الخطوة 6: التنظيف عند الإيقاف (اختياري)
+      # ========================================
+      - name: Cleanup on Stop
+        if: always()
+        run: |
+          Write-Host "جاري إيقاف جميع الخدمات..."
+          
+          # إيقاف بوت Telegram
+          Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force
+          
+          # إيقاف Tailscale
+          Get-Process tailscale -ErrorAction SilentlyContinue | Stop-Process -Force
+          
+          Write-Host "✅ تم إيقاف جميع الخدمات بنجاح"
