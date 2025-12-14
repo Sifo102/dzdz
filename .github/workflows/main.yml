@@ -120,8 +120,7 @@ jobs:
       - name: Keep RDP Alive
         run: |
           # إنشاء سكربت للبقاء نشطاً
-          $keepAliveScript = @'
-          while ($true) {
+          $keepAliveScript = 'while ($true) {
               $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
               Write-Host "[$currentTime] RDP is active on port 443"
               Write-Host "Public IP: $env:PUBLIC_IP"
@@ -143,8 +142,7 @@ jobs:
               }
               
               Start-Sleep -Seconds 60
-          }
-'@
+          }'
           
           $scriptPath = "$env:TEMP\KeepRDPAlive.ps1"
           $keepAliveScript | Out-File -FilePath $scriptPath -Encoding UTF8
