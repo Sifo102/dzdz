@@ -48,13 +48,9 @@ jobs:
 
       - name: Start Ngrok Tunnel
         run: |
-          # تشغيل ngrok
           Start-Process -FilePath "ngrok.exe" -ArgumentList "tcp 3389 --region us" -WindowStyle Hidden
-          
-          # الانتظار
           Start-Sleep -Seconds 15
           
-          # الحصول على العنوان
           $maxAttempts = 15
           $attempt = 0
           $ngrokUrl = $null
@@ -108,47 +104,43 @@ jobs:
           Write-Host "⚠️ Keep this workflow running!"
           Write-Host "════════════════════════════════════════"
 
-      - name: Keep Alive with Simple Script
+      - name: Keep Alive
         run: |
-          # إنشاء سكربت بسيط للحفاظ على الاتصال
-          $scriptContent = @"
-          `$count = 0
-          while (`$true) {
-              `$count++
-              `$time = Get-Date -Format "HH:mm:ss"
-              Write-Host "[`$time] RDP Active - Session `$count minutes"
-              
-              # التحقق من RDP
-              `$rdpService = Get-Service TermService
-              if (`$rdpService.Status -ne "Running") {
-                  Write-Host "Restarting RDP service..."
-                  Start-Service TermService
-                  Start-Sleep -Seconds 5
-              }
-              
-              # عرض حالة الاتصال
-              try {
-                  `$connections = Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue
-                  if (`$connections) {
-                      Write-Host "Port 3389 is listening"
-                  } else {
-                      Write-Host "Port 3389 not listening, restarting firewall rule..."
-                      netsh advfirewall firewall add rule name="RDP-KeepAlive" dir=in action=allow protocol=TCP localport=3389
-                  }
-              } catch {
-                  Write-Host "Checking connection status..."
-              }
-              
-              Start-Sleep -Seconds 60
-          }
-"@
+          # إنشاء سكربت بسيط
+          $scriptFile = "$env:TEMP\rdp_alive.ps1"
           
-          # حفظ السكربت
-          $scriptPath = "$env:TEMP\rdp_alive.ps1"
-          $scriptContent | Out-File -FilePath $scriptPath -Encoding UTF8
+          # كتابة السكربت سطراً سطراً
+          'while ($true) {' | Out-File -FilePath $scriptFile -Encoding UTF8
+          '    $count++' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '    $time = Get-Date -Format "HH:mm:ss"' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '    Write-Host "[$time] RDP Active - Session $count minutes"' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '    ' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '    # التحقق من RDP' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '    $rdpService = Get-Service TermService' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '    if ($rdpService.Status -ne "Running") {' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '        Write-Host "Restarting RDP service..."' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '        Start-Service TermService' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '        Start-Sleep -Seconds 5' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '    }' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '    ' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '    # عرض حالة الاتصال' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '    try {' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '        $connections = Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '        if ($connections) {' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '            Write-Host "Port 3389 is listening"' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '        } else {' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '            Write-Host "Port 3389 not listening, restarting firewall rule..."' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '            netsh advfirewall firewall add rule name="RDP-KeepAlive" dir=in action=allow protocol=TCP localport=3389' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '        }' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '    } catch {' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '        Write-Host "Checking connection status..."' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '    }' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '    ' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '    Start-Sleep -Seconds 60' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
+          '}' | Out-File -FilePath $scriptFile -Encoding UTF8 -Append
           
           # تشغيل السكربت في الخلفية
-          Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -File `"$scriptPath`"" -WindowStyle Hidden
+          Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -File `"$scriptFile`"" -WindowStyle Hidden
           
           Write-Host "✅ Keep-alive script started"
           
@@ -174,23 +166,3 @@ jobs:
               
               Start-Sleep -Seconds 60
           }
-
-      - name: Cleanup (if stopped)
-        if: always()
-        run: |
-          Write-Host "Cleaning up..."
-          
-          # إيقاف ngrok
-          Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force
-          
-          # إعادة تعيين RDP
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 1 -Force
-          
-          # تمكين جدار الحماية
-          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True
-          
-          # حذف قواعد جدار الحماية
-          netsh advfirewall firewall delete rule name="RDP"
-          netsh advfirewall firewall delete rule name="RDP-KeepAlive"
-          
-          Write-Host "✅ Cleanup completed"
