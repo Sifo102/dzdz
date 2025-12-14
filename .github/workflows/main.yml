@@ -1,5 +1,4 @@
-
-name: Public RDP on Port 443 with Ngrok
+name: Public RDP on Port 443 with Tunnel
 
 on: 
   workflow_dispatch:
@@ -12,24 +11,14 @@ jobs:
     steps:
       - name: Configure RDP Settings
         run: |
-          # تمكين RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          
-          # إزالة المصادقة بالكامل
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          
-          # تغيير المنفذ إلى 3389 (سيتولى ngrok المنفذ 443)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "PortNumber" -Value 3389 -Type DWord -Force
           
-          # تكوين جدار الحماية
           netsh advfirewall firewall delete rule name="RDP"
           netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
-          
-          # تعطيل جدار الحماية مؤقتاً
           Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
-          
-          # إعادة تشغيل خدمة RDP
           Restart-Service -Name TermService -Force
 
       - name: Create Administrator User
@@ -37,16 +26,13 @@ jobs:
           $password = "Admin@Secure123"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           
-          # إنشاء مستخدم جديد
           if (-not (Get-LocalUser -Name "PublicAdmin" -ErrorAction SilentlyContinue)) {
               New-LocalUser -Name "PublicAdmin" -Password $securePass -AccountNeverExpires
           }
           
-          # إضافة المستخدم إلى المجموعات المطلوبة
           Add-LocalGroupMember -Group "Administrators" -Member "PublicAdmin" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "PublicAdmin" -ErrorAction SilentlyContinue
           
-          # تكوين سياسات المستخدم
           net user PublicAdmin /active:yes
           net user PublicAdmin /passwordchg:no
           net user PublicAdmin /expires:never
@@ -54,197 +40,157 @@ jobs:
           echo "RDP_USER=PublicAdmin" >> $env:GITHUB_ENV
           echo "RDP_PASS=$password" >> $env:GITHUB_ENV
 
-      - name: Download and Install Ngrok
+      - name: Download Ngrok
         run: |
-          # تحميل ngrok
-          $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
-          $zipPath = "$env:TEMP\ngrok.zip"
-          $extractPath = "$env:TEMP\ngrok"
-          
-          Invoke-WebRequest -Uri $ngrokUrl -OutFile $zipPath
-          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
-          
-          # نسخ ngrok.exe إلى مجلد النظام
-          Copy-Item "$extractPath\ngrok.exe" "C:\Windows\System32\" -Force
-          
-          # تنظيف الملفات المؤقتة
-          Remove-Item $zipPath -Force
-          Remove-Item $extractPath -Recurse -Force
+          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile "$env:TEMP\ngrok.zip"
+          Expand-Archive -Path "$env:TEMP\ngrok.zip" -DestinationPath "$env:TEMP\ngrok" -Force
+          Copy-Item "$env:TEMP\ngrok\ngrok.exe" "C:\Windows\System32\" -Force
 
-      - name: Start Ngrok Tunnel for RDP
-        id: ngrok
+      - name: Start Ngrok Tunnel
         run: |
-          # تشغيل ngrok للوصول إلى RDP على المنفذ 443
-          # ملاحظة: الإصدار المجاني من ngrok يتطلب مصادقة، لكن يمكن استخدامه بدون token لمدة محدودة
-          Write-Host "Starting ngrok tunnel for RDP on port 443..."
-          
-          # تشغيل ngrok في الخلفية
+          # تشغيل ngrok
           Start-Process -FilePath "ngrok.exe" -ArgumentList "tcp 3389 --region us" -WindowStyle Hidden
           
-          # الانتظار قليلاً لبدء التشغيل
-          Start-Sleep -Seconds 10
+          # الانتظار
+          Start-Sleep -Seconds 15
           
-          # الحصول على عنوان ngrok العام
-          $retryCount = 0
-          $maxRetries = 10
+          # الحصول على العنوان
+          $maxAttempts = 15
+          $attempt = 0
           $ngrokUrl = $null
           
-          while (-not $ngrokUrl -and $retryCount -lt $maxRetries) {
+          while ($attempt -lt $maxAttempts -and !$ngrokUrl) {
               try {
                   $response = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction SilentlyContinue
                   if ($response.tunnels -and $response.tunnels[0].public_url) {
                       $ngrokUrl = $response.tunnels[0].public_url
-                      Write-Host "Ngrok URL found: $ngrokUrl"
+                      $ngrokUrl = $ngrokUrl -replace "^tcp://", ""
+                      Write-Host "Ngrok URL: $ngrokUrl"
                   }
               } catch {
-                  Write-Host "Waiting for ngrok API... Attempt $($retryCount + 1)/$maxRetries"
+                  Write-Host "Attempt $($attempt + 1)/$maxAttempts: Waiting for ngrok..."
               }
-              
-              $retryCount++
-              Start-Sleep -Seconds 5
+              $attempt++
+              Start-Sleep -Seconds 2
           }
           
-          if (-not $ngrokUrl) {
-              Write-Host "Failed to get ngrok URL, starting direct ngrok with log..."
-              # بديل: تشغيل ngrok مع عرض مباشر
-              Start-Process -FilePath "cmd.exe" -ArgumentList "/c ngrok tcp 3389 --region us --log stdout" -WindowStyle Normal
-              Start-Sleep -Seconds 5
-              $ngrokUrl = "ngrok-tcp-us.ngrok.io:443"
+          if ($ngrokUrl) {
+              echo "NGROK_URL=$ngrokUrl" >> $env:GITHUB_ENV
+              Write-Host "✅ Ngrok tunnel established: $ngrokUrl"
           } else {
-              # استخراج الاسم المضيف والمنفذ من URL
-              $ngrokUrl = $ngrokUrl -replace "^tcp://", ""
+              echo "NGROK_URL=ngrok-tcp-us.ngrok.io:443" >> $env:GITHUB_ENV
+              Write-Host "⚠️ Using default ngrok URL"
           }
-          
-          echo "NGROK_URL=$ngrokUrl" >> $env:GITHUB_ENV
-          Write-Host "Public RDP URL: $ngrokUrl"
 
-      - name: Alternative Tunnel Setup (Cloudflared)
-        if: env.NGROK_URL == ''
-        run: |
-          # بديل إذا فشل ngrok
-          Write-Host "Setting up Cloudflared tunnel as alternative..."
-          
-          # تحميل Cloudflared
-          $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          $cfPath = "$env:TEMP\cloudflared.exe"
-          
-          Invoke-WebRequest -Uri $cfUrl -OutFile $cfPath
-          
-          # تشغيل Cloudflared للنفق
-          $tunnelName = "rdp-tunnel-$env:GITHUB_RUN_ID"
-          Start-Process -FilePath $cfPath -ArgumentList "tunnel --url tcp://localhost:3389 --name $tunnelName" -WindowStyle Hidden
-          
-          Start-Sleep -Seconds 10
-          echo "CF_TUNNEL=$tunnelName" >> $env:GITHUB_ENV
-
-      - name: Display Connection Information
+      - name: Display Connection Info
         run: |
           Write-Host ""
-          Write-Host "================================================"
-          Write-Host "           PUBLIC RDP CONNECTION READY          "
-          Write-Host "================================================"
+          Write-Host "════════════════════════════════════════"
+          Write-Host "     RDP CONNECTION INFORMATION"
+          Write-Host "════════════════════════════════════════"
           
           if ($env:NGROK_URL) {
-              Write-Host "Public RDP Address: $env:NGROK_URL"
-          } elseif ($env:CF_TUNNEL) {
-              Write-Host "Cloudflare Tunnel: $env:CF_TUNNEL"
-              Write-Host "Use: cloudflared access tcp --hostname $env:CF_TUNNEL"
+              Write-Host "Public Address: $env:NGROK_URL"
+          } else {
+              Write-Host "Local Address: localhost:3389"
           }
           
-          Write-Host "Local Port: 3389"
           Write-Host "Username: $env:RDP_USER"
           Write-Host "Password: $env:RDP_PASS"
           Write-Host ""
-          Write-Host "Connection Instructions:"
+          Write-Host "To connect:"
           Write-Host "1. Open Remote Desktop Connection"
-          Write-Host "2. Enter the Public Address above"
-          Write-Host "3. Username: $env:RDP_USER"
-          Write-Host "4. Password: $env:RDP_PASS"
+          Write-Host "2. Enter the Public Address"
+          Write-Host "3. Click Connect"
+          Write-Host "4. Username: $env:RDP_USER"
+          Write-Host "5. Password: $env:RDP_PASS"
           Write-Host ""
-          Write-Host "================================================"
-          Write-Host "Note: Keep this workflow running"
-          Write-Host "================================================"
+          Write-Host "⚠️ Keep this workflow running!"
+          Write-Host "════════════════════════════════════════"
 
-      - name: Keep Session Alive
+      - name: Keep Alive with Simple Script
         run: |
-          Write-Host "RDP session is now active and publicly accessible"
-          Write-Host "This workflow will keep running in the background"
-          Write-Host ""
-          Write-Host "To stop: Click 'Cancel' in GitHub Actions"
-          Write-Host ""
-          
-          # إنشاء سكربت للحفاظ على الاتصال
-          $keepAliveScript = @'
-          while ($true) {
-              $time = Get-Date -Format "HH:mm:ss"
-              Write-Host "[$time] RDP Active - Port 3389"
+          # إنشاء سكربت بسيط للحفاظ على الاتصال
+          $scriptContent = @"
+          `$count = 0
+          while (`$true) {
+              `$count++
+              `$time = Get-Date -Format "HH:mm:ss"
+              Write-Host "[`$time] RDP Active - Session `$count minutes"
               
-              # التحقق من حالة RDP
-              $rdpStatus = Get-Service TermService
-              if ($rdpStatus.Status -ne "Running") {
+              # التحقق من RDP
+              `$rdpService = Get-Service TermService
+              if (`$rdpService.Status -ne "Running") {
                   Write-Host "Restarting RDP service..."
                   Start-Service TermService
+                  Start-Sleep -Seconds 5
               }
               
-              # التحقق من اتصالات ngrok
+              # عرض حالة الاتصال
               try {
-                  $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction SilentlyContinue
-                  if ($tunnels.tunnels) {
-                      foreach ($tunnel in $tunnels.tunnels) {
-                          Write-Host "Tunnel: $($tunnel.public_url)"
-                      }
+                  `$connections = Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue
+                  if (`$connections) {
+                      Write-Host "Port 3389 is listening"
+                  } else {
+                      Write-Host "Port 3389 not listening, restarting firewall rule..."
+                      netsh advfirewall firewall add rule name="RDP-KeepAlive" dir=in action=allow protocol=TCP localport=3389
                   }
               } catch {
-                  Write-Host "Ngrok monitoring unavailable"
+                  Write-Host "Checking connection status..."
               }
               
-              Start-Sleep -Seconds 30
+              Start-Sleep -Seconds 60
           }
-'@
+"@
           
-          $scriptPath = "$env:TEMP\KeepRDPAlive.ps1"
-          $keepAliveScript | Out-File -FilePath $scriptPath -Encoding UTF8
+          # حفظ السكربت
+          $scriptPath = "$env:TEMP\rdp_alive.ps1"
+          $scriptContent | Out-File -FilePath $scriptPath -Encoding UTF8
           
           # تشغيل السكربت في الخلفية
           Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass -File `"$scriptPath`"" -WindowStyle Hidden
           
-          # البقاء نشطاً
-          $counter = 0
+          Write-Host "✅ Keep-alive script started"
+          
+          # البقاء في العملية الرئيسية
+          $minutes = 0
           while ($true) {
-              $counter++
-              $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-              Write-Host "[$currentTime] Session active for $counter minutes"
+              $minutes++
+              Write-Host ""
+              Write-Host "========================================"
+              Write-Host "RDP Session Active - $minutes minutes"
+              Write-Host "========================================"
               
               if ($env:NGROK_URL) {
                   Write-Host "Public URL: $env:NGROK_URL"
               }
               
-              Write-Host "Press Ctrl+C in GitHub Actions to stop"
+              Write-Host "Local: localhost:3389"
+              Write-Host "User: $env:RDP_USER"
+              Write-Host "Pass: $env:RDP_PASS"
               Write-Host ""
+              Write-Host "To stop: Cancel this workflow in GitHub"
+              Write-Host "========================================"
               
               Start-Sleep -Seconds 60
           }
 
-      - name: Cleanup on Stop
+      - name: Cleanup (if stopped)
         if: always()
         run: |
-          Write-Host "Cleaning up RDP configuration..."
+          Write-Host "Cleaning up..."
           
-          # إعادة تعيين إعدادات RDP
+          # إيقاف ngrok
+          Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force
+          
+          # إعادة تعيين RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 1 -Force
-          
-          # إعادة تمكين المصادقة
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 2 -Force
-          
-          # إعادة تعيين المنفذ
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "PortNumber" -Value 3389 -Type DWord -Force
           
           # تمكين جدار الحماية
           Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True
           
-          # إيقاف ngrok
-          Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force
-          Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue | Stop-Process -Force
+          # حذف قواعد جدار الحماية
+          netsh advfirewall firewall delete rule name="RDP"
+          netsh advfirewall firewall delete rule name="RDP-KeepAlive"
           
-          Write-Host "Cleanup completed"
+          Write-Host "✅ Cleanup completed"
