@@ -1,4 +1,3 @@
-
 name: Telegram Bot + RDP Server
 on:
   workflow_dispatch:
@@ -102,162 +101,150 @@ jobs:
       # ========================================
       - name: Create Telegram Bot Python Script
         run: |
-          $botScript = @'
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-import os
-import logging
-import asyncio
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-
-# ==================== إعدادات البوت ====================
-TELEGRAM_TOKEN = "7548278006:AAEGJlnZ4hqwAlmJrHnKQ4R6zunDlPkyAyo"
-
-# ==================== إعداد التسجيل ====================
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler('telegram_bot.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# ==================== معالجة الرسائل ====================
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة جميع الرسائل الواردة"""
-    user = update.effective_user
-    user_id = user.id
-    user_name = user.first_name or "مستخدم"
-    text = update.message.text
-    
-    logger.info(f"رسالة من {user_name} (ID: {user_id}): {text}")
-    
-    # الرسالة الترحيبية الأولى (فورية)
-    welcome1 = f"""
-╔══════════════════════════════════════╗
-║       🎊 **مرحباً بك عزيزي!** 🎊       ║
-╚══════════════════════════════════════╝
-
-✨ **أهلاً وسهلاً {user_name}** ✨
-
-🆔 **معرفك:** `{user_id}`
-👤 **اسمك:** {user_name}
-📝 **رسالتك:** {text[:50] if text else "بدون نص"}
-
-🏆 **شكراً لتواصلك معنا!**
-"""
-    
-    await update.message.reply_text(welcome1, parse_mode='Markdown')
-    
-    # الرسالة الترحيبية الثانية (فورية بدون تأخير)
-    welcome2 = """
-🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯
-╔══════════════════════════════════════╗
-║     🚀 **رسالة ترحيب ثانية!** 🚀      ║
-╚══════════════════════════════════════╝
-🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯
-
-📌 **مميزات البوت:**
-✅ رد فوري على جميع الرسائل
-✅ ترحيب مزدوج بدون تأخير
-✅ تشغيل مستمر 24/7
-✅ متكامل مع خادم RDP
-
-🔧 **الحالة:** البوت يعمل بنجاح!
-🕐 **الوقت:** الآن
-📊 **الحالة:** نشط ✅
-
-💬 **يمكنك إرسال أي رسالة وسأرد عليك فوراً!**
-"""
-    
-    await update.message.reply_text(welcome2, parse_mode='Markdown')
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة أمر /start"""
-    user = update.effective_user
-    
-    start_message = f"""
-🚀 **تم بدء البوت بنجاح!**
-
-👋 أهلاً {user.first_name}!
-    
-📋 **الأوامر المتاحة:**
-/start - بدء البوت
-/help - المساعدة
-أي رسالة - سأرد بترحيب مزدوج!
-
-⚡ **البوت يعمل على خادم GitHub Actions**
-🖥️ **مع خادم RDP نشط**
-"""
-    
-    await update.message.reply_text(start_message, parse_mode='Markdown')
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة أمر /help"""
-    help_text = """
-🆘 **مساعدة البوت:**
-
-📝 **كيفية الاستخدام:**
-1. أرسل أي رسالة
-2. سأرد عليك برسالتين ترحيبيتين
-3. لا حاجة لأوامر معقدة
-
-🔧 **المميزات:**
-- رد فوري بدون تأخير
-- تشغيل مستمر 24/7
-- متكامل مع RDP
-
-📞 **لأي استفسار:** أرسل رسالة وسأرد فوراً!
-"""
-    
-    await update.message.reply_text(help_text, parse_mode='Markdown')
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة الأخطاء"""
-    logger.error(f"حدث خطأ: {context.error}")
-    if update and update.message:
-        await update.message.reply_text("⚠️ حدث خطأ، جاري المحاولة مرة أخرى...")
-
-# ==================== الدالة الرئيسية ====================
-def main():
-    """الدالة الرئيسية لتشغيل البوت"""
-    logger.info("بدء تشغيل بوت Telegram...")
-    
-    try:
-        # إنشاء التطبيق
-        application = Application.builder().token(TELEGRAM_TOKEN).build()
-        
-        # إضافة المعالجات
-        application.add_handler(CommandHandler("start", start_command))
-        application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        
-        # إضافة معالج الأخطاء
-        application.add_error_handler(error_handler)
-        
-        logger.info("البوت جاهز للاستقبال...")
-        
-        # بدء الاستماع للرسائل
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-        
-    except Exception as e:
-        logger.error(f"خطأ في تشغيل البوت: {e}")
-        raise
-
-# ==================== نقطة الدخول ====================
-if __name__ == "__main__":
-    main()
-'@
+          # إنشاء ملف Python للبوت - استخدام طريقة سطر بسطر لتجنب مشاكل YAML
+          New-Item -Path "telegram_bot.py" -ItemType File -Force
           
-          # حفظ ملف البوت
-          $botScript | Out-File -FilePath "telegram_bot.py" -Encoding UTF8
+          # كتابة محتوى الملف سطر بسطر
+          Add-Content -Path "telegram_bot.py" -Value "#!/usr/bin/env python3"
+          Add-Content -Path "telegram_bot.py" -Value "# -*- coding: utf-8 -*-"
+          Add-Content -Path "telegram_bot.py" -Value "import os"
+          Add-Content -Path "telegram_bot.py" -Value "import logging"
+          Add-Content -Path "telegram_bot.py" -Value "import asyncio"
+          Add-Content -Path "telegram_bot.py" -Value "from telegram import Update"
+          Add-Content -Path "telegram_bot.py" -Value "from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes"
+          Add-Content -Path "telegram_bot.py" -Value ""
+          Add-Content -Path "telegram_bot.py" -Value "# ==================== إعدادات البوت ===================="
+          Add-Content -Path "telegram_bot.py" -Value 'TELEGRAM_TOKEN = "7548278006:AAEGJlnZ4hqwAlmJrHnKQ4R6zunDlPkyAyo"'
+          Add-Content -Path "telegram_bot.py" -Value ""
+          Add-Content -Path "telegram_bot.py" -Value "# ==================== إعداد التسجيل ===================="
+          Add-Content -Path "telegram_bot.py" -Value "logging.basicConfig("
+          Add-Content -Path "telegram_bot.py" -Value "    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',"
+          Add-Content -Path "telegram_bot.py" -Value "    level=logging.INFO,"
+          Add-Content -Path "telegram_bot.py" -Value "    handlers=["
+          Add-Content -Path "telegram_bot.py" -Value "        logging.FileHandler('telegram_bot.log'),"
+          Add-Content -Path "telegram_bot.py" -Value "        logging.StreamHandler()"
+          Add-Content -Path "telegram_bot.py" -Value "    ]"
+          Add-Content -Path "telegram_bot.py" -Value ")"
+          Add-Content -Path "telegram_bot.py" -Value "logger = logging.getLogger(__name__)"
+          Add-Content -Path "telegram_bot.py" -Value ""
+          Add-Content -Path "telegram_bot.py" -Value "# ==================== معالجة الرسائل ===================="
+          Add-Content -Path "telegram_bot.py" -Value "async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):"
+          Add-Content -Path "telegram_bot.py" -Value '    """معالجة جميع الرسائل الواردة"""'
+          Add-Content -Path "telegram_bot.py" -Value "    user = update.effective_user"
+          Add-Content -Path "telegram_bot.py" -Value "    user_id = user.id"
+          Add-Content -Path "telegram_bot.py" -Value "    user_name = user.first_name or 'مستخدم'"
+          Add-Content -Path "telegram_bot.py" -Value "    text = update.message.text"
+          Add-Content -Path "telegram_bot.py" -Value "    "
+          Add-Content -Path "telegram_bot.py" -Value "    logger.info(f'رسالة من {user_name} (ID: {user_id}): {text}')"
+          Add-Content -Path "telegram_bot.py" -Value "    "
+          Add-Content -Path "telegram_bot.py" -Value "    # الرسالة الترحيبية الأولى (فورية)"
+          Add-Content -Path "telegram_bot.py" -Value '    welcome1 = f"""'
+          Add-Content -Path "telegram_bot.py" -Value '╔══════════════════════════════════════╗'
+          Add-Content -Path "telegram_bot.py" -Value '║       🎊 **مرحباً بك عزيزي!** 🎊       ║'
+          Add-Content -Path "telegram_bot.py" -Value '╚══════════════════════════════════════╝'
+          Add-Content -Path "telegram_bot.py" -Value ''
+          Add-Content -Path "telegram_bot.py" -Value '✨ **أهلاً وسهلاً {user_name}** ✨'
+          Add-Content -Path "telegram_bot.py" -Value ''
+          Add-Content -Path "telegram_bot.py" -Value '🆔 **معرفك:** `{user_id}`'
+          Add-Content -Path "telegram_bot.py" -Value '👤 **اسمك:** {user_name}'
+          Add-Content -Path "telegram_bot.py" -Value '📝 **رسالتك:** {text[:50] if text else "بدون نص"}'
+          Add-Content -Path "telegram_bot.py" -Value ''
+          Add-Content -Path "telegram_bot.py" -Value '🏆 **شكراً لتواصلك معنا!**'
+          Add-Content -Path "telegram_bot.py" -Value '"""'
+          Add-Content -Path "telegram_bot.py" -Value "    "
+          Add-Content -Path "telegram_bot.py" -Value "    await update.message.reply_text(welcome1, parse_mode='Markdown')"
+          Add-Content -Path "telegram_bot.py" -Value "    "
+          Add-Content -Path "telegram_bot.py" -Value "    # الرسالة الترحيبية الثانية (فورية بدون تأخير)"
+          Add-Content -Path "telegram_bot.py" -Value '    welcome2 = """'
+          Add-Content -Path "telegram_bot.py" -Value '🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯'
+          Add-Content -Path "telegram_bot.py" -Value '╔══════════════════════════════════════╗'
+          Add-Content -Path "telegram_bot.py" -Value '║     🚀 **رسالة ترحيب ثانية!** 🚀      ║'
+          Add-Content -Path "telegram_bot.py" -Value '╚══════════════════════════════════════╝'
+          Add-Content -Path "telegram_bot.py" -Value '🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯'
+          Add-Content -Path "telegram_bot.py" -Value ''
+          Add-Content -Path "telegram_bot.py" -Value '📌 **مميزات البوت:**'
+          Add-Content -Path "telegram_bot.py" -Value '✅ رد فوري على جميع الرسائل'
+          Add-Content -Path "telegram_bot.py" -Value '✅ ترحيب مزدوج بدون تأخير'
+          Add-Content -Path "telegram_bot.py" -Value '✅ تشغيل مستمر 24/7'
+          Add-Content -Path "telegram_bot.py" -Value '✅ متكامل مع خادم RDP'
+          Add-Content -Path "telegram_bot.py" -Value ''
+          Add-Content -Path "telegram_bot.py" -Value '🔧 **الحالة:** البوت يعمل بنجاح!'
+          Add-Content -Path "telegram_bot.py" -Value '🕐 **الوقت:** الآن'
+          Add-Content -Path "telegram_bot.py" -Value '📊 **الحالة:** نشط ✅'
+          Add-Content -Path "telegram_bot.py" -Value ''
+          Add-Content -Path "telegram_bot.py" -Value '💬 **يمكنك إرسال أي رسالة وسأرد عليك فوراً!**'
+          Add-Content -Path "telegram_bot.py" -Value '"""'
+          Add-Content -Path "telegram_bot.py" -Value "    "
+          Add-Content -Path "telegram_bot.py" -Value "    await update.message.reply_text(welcome2, parse_mode='Markdown')"
+          Add-Content -Path "telegram_bot.py" -Value ""
+          Add-Content -Path "telegram_bot.py" -Value "async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):"
+          Add-Content -Path "telegram_bot.py" -Value '    """معالجة أمر /start"""'
+          Add-Content -Path "telegram_bot.py" -Value "    user = update.effective_user"
+          Add-Content -Path "telegram_bot.py" -Value "    "
+          Add-Content -Path "telegram_bot.py" -Value '    start_message = f"""'
+          Add-Content -Path "telegram_bot.py" -Value '🚀 **تم بدء البوت بنجاح!**'
+          Add-Content -Path "telegram_bot.py" -Value ''
+          Add-Content -Path "telegram_bot.py" -Value '👋 أهلاً {user.first_name}!'
+          Add-Content -Path "telegram_bot.py" -Value '    '
+          Add-Content -Path "telegram_bot.py" -Value '📋 **الأوامر المتاحة:**'
+          Add-Content -Path "telegram_bot.py" -Value '/start - بدء البوت'
+          Add-Content -Path "telegram_bot.py" -Value '/help - المساعدة'
+          Add-Content -Path "telegram_bot.py" -Value 'أي رسالة - سأرد بترحيب مزدوج!'
+          Add-Content -Path "telegram_bot.py" -Value ''
+          Add-Content -Path "telegram_bot.py" -Value '⚡ **البوت يعمل على خادم GitHub Actions**'
+          Add-Content -Path "telegram_bot.py" -Value '🖥️ **مع خادم RDP نشط**'
+          Add-Content -Path "telegram_bot.py" -Value '"""'
+          Add-Content -Path "telegram_bot.py" -Value "    "
+          Add-Content -Path "telegram_bot.py" -Value "    await update.message.reply_text(start_message, parse_mode='Markdown')"
+          Add-Content -Path "telegram_bot.py" -Value ""
+          Add-Content -Path "telegram_bot.py" -Value "async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):"
+          Add-Content -Path "telegram_bot.py" -Value '    """معالجة أمر /help"""'
+          Add-Content -Path "telegram_bot.py" -Value '    help_text = """'
+          Add-Content -Path "telegram_bot.py" -Value '🆘 **مساعدة البوت:**'
+          Add-Content -Path "telegram_bot.py" -Value ''
+          Add-Content -Path "telegram_bot.py" -Value '📝 **كيفية الاستخدام:**'
+          Add-Content -Path "telegram_bot.py" -Value '1. أرسل أي رسالة'
+          Add-Content -Path "telegram_bot.py" -Value '2. سأرد عليك برسالتين ترحيبيتين'
+          Add-Content -Path "telegram_bot.py" -Value '3. لا حاجة لأوامر معقدة'
+          Add-Content -Path "telegram_bot.py" -Value ''
+          Add-Content -Path "telegram_bot.py" -Value '🔧 **المميزات:**'
+          Add-Content -Path "telegram_bot.py" -Value '- رد فوري بدون تأخير'
+          Add-Content -Path "telegram_bot.py" -Value '- تشغيل مستمر 24/7'
+          Add-Content -Path "telegram_bot.py" -Value '- متكامل مع RDP'
+          Add-Content -Path "telegram_bot.py" -Value ''
+          Add-Content -Path "telegram_bot.py" -Value '📞 **لأي استفسار:** أرسل رسالة وسأرد فوراً!'
+          Add-Content -Path "telegram_bot.py" -Value '"""'
+          Add-Content -Path "telegram_bot.py" -Value "    "
+          Add-Content -Path "telegram_bot.py" -Value "    await update.message.reply_text(help_text, parse_mode='Markdown')"
+          Add-Content -Path "telegram_bot.py" -Value ""
+          Add-Content -Path "telegram_bot.py" -Value "# ==================== الدالة الرئيسية ===================="
+          Add-Content -Path "telegram_bot.py" -Value "def main():"
+          Add-Content -Path "telegram_bot.py" -Value '    """الدالة الرئيسية لتشغيل البوت"""'
+          Add-Content -Path "telegram_bot.py" -Value "    logger.info('بدء تشغيل بوت Telegram...')"
+          Add-Content -Path "telegram_bot.py" -Value "    "
+          Add-Content -Path "telegram_bot.py" -Value "    try:"
+          Add-Content -Path "telegram_bot.py" -Value "        # إنشاء التطبيق"
+          Add-Content -Path "telegram_bot.py" -Value "        application = Application.builder().token(TELEGRAM_TOKEN).build()"
+          Add-Content -Path "telegram_bot.py" -Value "        "
+          Add-Content -Path "telegram_bot.py" -Value "        # إضافة المعالجات"
+          Add-Content -Path "telegram_bot.py" -Value "        application.add_handler(CommandHandler('start', start_command))"
+          Add-Content -Path "telegram_bot.py" -Value "        application.add_handler(CommandHandler('help', help_command))"
+          Add-Content -Path "telegram_bot.py" -Value "        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))"
+          Add-Content -Path "telegram_bot.py" -Value "        "
+          Add-Content -Path "telegram_bot.py" -Value "        logger.info('البوت جاهز للاستقبال...')"
+          Add-Content -Path "telegram_bot.py" -Value "        "
+          Add-Content -Path "telegram_bot.py" -Value "        # بدء الاستماع للرسائل"
+          Add-Content -Path "telegram_bot.py" -Value "        application.run_polling(allowed_updates=Update.ALL_TYPES)"
+          Add-Content -Path "telegram_bot.py" -Value "        "
+          Add-Content -Path "telegram_bot.py" -Value "    except Exception as e:"
+          Add-Content -Path "telegram_bot.py" -Value "        logger.error(f'خطأ في تشغيل البوت: {e}')"
+          Add-Content -Path "telegram_bot.py" -Value "        raise"
+          Add-Content -Path "telegram_bot.py" -Value ""
+          Add-Content -Path "telegram_bot.py" -Value "# ==================== نقطة الدخول ===================="
+          Add-Content -Path "telegram_bot.py" -Value 'if __name__ == "__main__":'
+          Add-Content -Path "telegram_bot.py" -Value "    main()"
+          
           Write-Host "✅ Telegram bot script created successfully!"
-          
-          # عرض محتوى الملف للمراجعة
-          Get-Content "telegram_bot.py" -First 10
 
       # ========================================
       # الخطوة 4: تشغيل بوت Telegram في الخلفية
@@ -266,39 +253,20 @@ if __name__ == "__main__":
         run: |
           Write-Host "Starting Telegram Bot..."
           
-          # إنشاء ملف باتش لتشغيل البوت في الخلفية
-          $batchScript = @'
-@echo off
-echo ========================================
-echo    تشغيل بوت Telegram على GitHub Actions
-echo ========================================
-echo.
-echo [%date% %time%] بدء تشغيل البوت...
-python telegram_bot.py
-if errorlevel 1 (
-    echo [%date% %time%] خطأ في تشغيل البوت، إعادة المحاولة...
-    timeout /t 5 /nobreak
-    python telegram_bot.py
-)
-'@
-          
-          $batchScript | Out-File -FilePath "start_bot.bat" -Encoding ASCII
-          
-          # تشغيل البوت في نافذة جديدة (خلفية)
-          Start-Process cmd.exe -ArgumentList "/c start_bot.bat" -WindowStyle Hidden
+          # تشغيل البوت في الخلفية
+          Start-Process python -ArgumentList "telegram_bot.py" -WindowStyle Hidden
           
           # الانتظار قليلاً للتأكد من بدء التشغيل
           Start-Sleep -Seconds 10
           
           # التحقق من تشغيل البوت
-          $botProcess = Get-Process python -ErrorAction SilentlyContinue
+          $botProcess = Get-Process python -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -like "*telegram*" -or $_.ProcessName -eq "python"}
           if ($botProcess) {
               Write-Host "✅ Telegram Bot is running! (PID: $($botProcess.Id))"
           } else {
-              Write-Host "⚠️ Bot process not found, trying alternative method..."
-              # محاولة بديلة
-              Start-Process python -ArgumentList "telegram_bot.py" -WindowStyle Hidden
-              Start-Sleep -Seconds 5
+              Write-Host "⚠️ Bot process not found, trying to run directly..."
+              # تشغيل مباشر للتحقق
+              python telegram_bot.py &
           }
 
       # ========================================
@@ -306,33 +274,33 @@ if errorlevel 1 (
       # ========================================
       - name: Maintain Both Services Running
         run: |
-          Write-Host "`n"
+          Write-Host ""
           Write-Host "╔══════════════════════════════════════════════════════╗"
           Write-Host "║      ✅ جميع الخدمات تعمل بنجاح! ✅                  ║"
           Write-Host "╚══════════════════════════════════════════════════════╝"
-          Write-Host "`n"
+          Write-Host ""
           
           Write-Host "=================== RDP ACCESS ==================="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: TOOLBOXLAP"
           Write-Host "Password: admin@123"
-          Write-Host "`n"
+          Write-Host ""
           
           Write-Host "================ TELEGRAM BOT ===================="
           Write-Host "Bot Token: 7548278006:AAEGJlnZ4hqwAlmJrHnKQ4R6zunDlPkyAyo"
           Write-Host "Status: Running in background"
           Write-Host "Features: Instant reply with double welcome messages"
-          Write-Host "`n"
+          Write-Host ""
           
           Write-Host "============== SYSTEM INFORMATION ==============="
           Write-Host "Host: GitHub Actions Windows Runner"
           Write-Host "Services: RDP Server + Telegram Bot"
           Write-Host "Uptime: Will run for 60 hours (3600 minutes)"
-          Write-Host "`n"
+          Write-Host ""
           
           Write-Host "📌 للاتصال بـ RDP: استخدم العنوان أعلاه"
           Write-Host "🤖 للاتصال بالبوت: أرسل أي رسالة إلى البوت"
-          Write-Host "`n"
+          Write-Host ""
           
           # عداد الوقت والحفاظ على التشغيل
           $minutes = 0
@@ -341,13 +309,13 @@ if errorlevel 1 (
               $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
               
               if ($minutes % 30 -eq 0) {
-                  Write-Host "`n"
+                  Write-Host ""
                   Write-Host "════════════════════════════════════════════════"
                   Write-Host "[$currentTime] النظام يعمل - $minutes دقيقة"
                   Write-Host "════════════════════════════════════════════════"
                   
                   # التحقق من حالة البوت
-                  $botProcess = Get-Process python -ErrorAction SilentlyContinue
+                  $botProcess = Get-Process python -ErrorAction SilentlyContinue | Select-Object -First 1
                   if ($botProcess) {
                       Write-Host "Telegram Bot: ✅ نشط (PID: $($botProcess.Id))"
                   } else {
@@ -363,19 +331,3 @@ if errorlevel 1 (
               Write-Host "[$currentTime] جميع الخدمات تعمل - اضغط Ctrl+C في GitHub لإيقاف"
               Start-Sleep -Seconds 60
           }
-
-      # ========================================
-      # الخطوة 6: التنظيف عند الإيقاف (اختياري)
-      # ========================================
-      - name: Cleanup on Stop
-        if: always()
-        run: |
-          Write-Host "جاري إيقاف جميع الخدمات..."
-          
-          # إيقاف بوت Telegram
-          Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force
-          
-          # إيقاف Tailscale
-          Get-Process tailscale -ErrorAction SilentlyContinue | Stop-Process -Force
-          
-          Write-Host "✅ تم إيقاف جميع الخدمات بنجاح"
