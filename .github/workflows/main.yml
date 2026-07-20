@@ -1,333 +1,73 @@
-name: Telegram Bot + RDP Server
-on:
-  workflow_dispatch:
+name: Windows RDP via Ngrok
+
+on: [push]
+
 jobs:
-  telegram-bot-rdp:
+  rdp-setup:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
+
     steps:
-      # ========================================
-      # الخطوة 1: إعداد RDP الأساسي
-      # ========================================
-      - name: Configure Core RDP Settings
+      - name: Download and Extract Ngrok
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
+          Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-windows-amd64.zip" -OutFile ngrok.zip
+          Expand-Archive ngrok.zip -DestinationPath "$env:USERPROFILE"
+          Remove-Item ngrok.zip
+          Copy-Item "$env:USERPROFILE\ngrok.exe" "$env:GITHUB_WORKSPACE"
 
-      - name: Create RDP User with Static Password
+      - name: Authenticate Ngrok
         run: |
-          $password = "admin@123"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          $ErrorActionPreference = "Stop"
+          .\ngrok.exe authtoken "${{ secrets.NGROK_AUTH_TOKEN }}"
 
-          if (-not (Get-LocalUser -Name "TOOLBOXLAP" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "TOOLBOXLAP" -Password $securePass -AccountNeverExpires
-          }
-
-          Add-LocalGroupMember -Group "Administrators" -Member "TOOLBOXLAP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TOOLBOXLAP"
-
-          echo "RDP_CREDS=User: TOOLBOXLAP | Password: $password" >> $env:GITHUB_ENV
-
-          if (-not (Get-LocalUser -Name "TOOLBOXLAP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
-
-      - name: Install Tailscale
+      - name: Enable Remote Desktop (RDP) and Firewall
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          New-NetFirewallRule -DisplayName "Allow Remote Desktop via Ngrok" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389
 
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-
-      - name: Establish Tailscale Connection
+      - name: Create Admin User
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          net user kamel007 Kamel@123 /add
+          net localgroup administrators kamel007 /add
+
+      - name: Start Ngrok Tunnel
+        run: |
+          Start-Process -FilePath "$pwd\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout" -NoNewWindow -RedirectStandardOutput ngrok.log
+          $tunnelUrl = $null
+          $timeout = 60
+          while ($timeout -gt 0 -and -not $tunnelUrl) {
               Start-Sleep -Seconds 5
-              $retries++
-          }
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
-
-      # ========================================
-      # الخطوة 2: إعداد Python ومكتبات Telegram
-      # ========================================
-      - name: Install Python and Required Packages
-        run: |
-          Write-Host "Installing Python packages for Telegram Bot..."
-          
-          # تثبيت Python (إذا لم يكن مثبتاً)
-          $pythonInstalled = Get-Command python -ErrorAction SilentlyContinue
-          if (-not $pythonInstalled) {
-              Write-Host "Python not found, installing via winget..."
-              winget install --id Python.Python.3.11 -e --accept-package-agreements --accept-source-agreements
-          }
-          
-          # تحديث pip
-          python -m pip install --upgrade pip
-          
-          # تثبيت مكتبات Telegram
-          pip install python-telegram-bot==20.3
-          pip install requests
-          pip install asyncio
-          
-          Write-Host "Python packages installed successfully!"
-
-      # ========================================
-      # الخطوة 3: إنشاء ملف بوت Telegram
-      # ========================================
-      - name: Create Telegram Bot Python Script
-        run: |
-          # إنشاء ملف Python للبوت - استخدام طريقة سطر بسطر لتجنب مشاكل YAML
-          New-Item -Path "telegram_bot.py" -ItemType File -Force
-          
-          # كتابة محتوى الملف سطر بسطر
-          Add-Content -Path "telegram_bot.py" -Value "#!/usr/bin/env python3"
-          Add-Content -Path "telegram_bot.py" -Value "# -*- coding: utf-8 -*-"
-          Add-Content -Path "telegram_bot.py" -Value "import os"
-          Add-Content -Path "telegram_bot.py" -Value "import logging"
-          Add-Content -Path "telegram_bot.py" -Value "import asyncio"
-          Add-Content -Path "telegram_bot.py" -Value "from telegram import Update"
-          Add-Content -Path "telegram_bot.py" -Value "from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes"
-          Add-Content -Path "telegram_bot.py" -Value ""
-          Add-Content -Path "telegram_bot.py" -Value "# ==================== إعدادات البوت ===================="
-          Add-Content -Path "telegram_bot.py" -Value 'TELEGRAM_TOKEN = "7548278006:AAEGJlnZ4hqwAlmJrHnKQ4R6zunDlPkyAyo"'
-          Add-Content -Path "telegram_bot.py" -Value ""
-          Add-Content -Path "telegram_bot.py" -Value "# ==================== إعداد التسجيل ===================="
-          Add-Content -Path "telegram_bot.py" -Value "logging.basicConfig("
-          Add-Content -Path "telegram_bot.py" -Value "    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',"
-          Add-Content -Path "telegram_bot.py" -Value "    level=logging.INFO,"
-          Add-Content -Path "telegram_bot.py" -Value "    handlers=["
-          Add-Content -Path "telegram_bot.py" -Value "        logging.FileHandler('telegram_bot.log'),"
-          Add-Content -Path "telegram_bot.py" -Value "        logging.StreamHandler()"
-          Add-Content -Path "telegram_bot.py" -Value "    ]"
-          Add-Content -Path "telegram_bot.py" -Value ")"
-          Add-Content -Path "telegram_bot.py" -Value "logger = logging.getLogger(__name__)"
-          Add-Content -Path "telegram_bot.py" -Value ""
-          Add-Content -Path "telegram_bot.py" -Value "# ==================== معالجة الرسائل ===================="
-          Add-Content -Path "telegram_bot.py" -Value "async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):"
-          Add-Content -Path "telegram_bot.py" -Value '    """معالجة جميع الرسائل الواردة"""'
-          Add-Content -Path "telegram_bot.py" -Value "    user = update.effective_user"
-          Add-Content -Path "telegram_bot.py" -Value "    user_id = user.id"
-          Add-Content -Path "telegram_bot.py" -Value "    user_name = user.first_name or 'مستخدم'"
-          Add-Content -Path "telegram_bot.py" -Value "    text = update.message.text"
-          Add-Content -Path "telegram_bot.py" -Value "    "
-          Add-Content -Path "telegram_bot.py" -Value "    logger.info(f'رسالة من {user_name} (ID: {user_id}): {text}')"
-          Add-Content -Path "telegram_bot.py" -Value "    "
-          Add-Content -Path "telegram_bot.py" -Value "    # الرسالة الترحيبية الأولى (فورية)"
-          Add-Content -Path "telegram_bot.py" -Value '    welcome1 = f"""'
-          Add-Content -Path "telegram_bot.py" -Value '╔══════════════════════════════════════╗'
-          Add-Content -Path "telegram_bot.py" -Value '║       🎊 **مرحباً بك عزيزي!** 🎊       ║'
-          Add-Content -Path "telegram_bot.py" -Value '╚══════════════════════════════════════╝'
-          Add-Content -Path "telegram_bot.py" -Value ''
-          Add-Content -Path "telegram_bot.py" -Value '✨ **أهلاً وسهلاً {user_name}** ✨'
-          Add-Content -Path "telegram_bot.py" -Value ''
-          Add-Content -Path "telegram_bot.py" -Value '🆔 **معرفك:** `{user_id}`'
-          Add-Content -Path "telegram_bot.py" -Value '👤 **اسمك:** {user_name}'
-          Add-Content -Path "telegram_bot.py" -Value '📝 **رسالتك:** {text[:50] if text else "بدون نص"}'
-          Add-Content -Path "telegram_bot.py" -Value ''
-          Add-Content -Path "telegram_bot.py" -Value '🏆 **شكراً لتواصلك معنا!**'
-          Add-Content -Path "telegram_bot.py" -Value '"""'
-          Add-Content -Path "telegram_bot.py" -Value "    "
-          Add-Content -Path "telegram_bot.py" -Value "    await update.message.reply_text(welcome1, parse_mode='Markdown')"
-          Add-Content -Path "telegram_bot.py" -Value "    "
-          Add-Content -Path "telegram_bot.py" -Value "    # الرسالة الترحيبية الثانية (فورية بدون تأخير)"
-          Add-Content -Path "telegram_bot.py" -Value '    welcome2 = """'
-          Add-Content -Path "telegram_bot.py" -Value '🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯'
-          Add-Content -Path "telegram_bot.py" -Value '╔══════════════════════════════════════╗'
-          Add-Content -Path "telegram_bot.py" -Value '║     🚀 **رسالة ترحيب ثانية!** 🚀      ║'
-          Add-Content -Path "telegram_bot.py" -Value '╚══════════════════════════════════════╝'
-          Add-Content -Path "telegram_bot.py" -Value '🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯'
-          Add-Content -Path "telegram_bot.py" -Value ''
-          Add-Content -Path "telegram_bot.py" -Value '📌 **مميزات البوت:**'
-          Add-Content -Path "telegram_bot.py" -Value '✅ رد فوري على جميع الرسائل'
-          Add-Content -Path "telegram_bot.py" -Value '✅ ترحيب مزدوج بدون تأخير'
-          Add-Content -Path "telegram_bot.py" -Value '✅ تشغيل مستمر 24/7'
-          Add-Content -Path "telegram_bot.py" -Value '✅ متكامل مع خادم RDP'
-          Add-Content -Path "telegram_bot.py" -Value ''
-          Add-Content -Path "telegram_bot.py" -Value '🔧 **الحالة:** البوت يعمل بنجاح!'
-          Add-Content -Path "telegram_bot.py" -Value '🕐 **الوقت:** الآن'
-          Add-Content -Path "telegram_bot.py" -Value '📊 **الحالة:** نشط ✅'
-          Add-Content -Path "telegram_bot.py" -Value ''
-          Add-Content -Path "telegram_bot.py" -Value '💬 **يمكنك إرسال أي رسالة وسأرد عليك فوراً!**'
-          Add-Content -Path "telegram_bot.py" -Value '"""'
-          Add-Content -Path "telegram_bot.py" -Value "    "
-          Add-Content -Path "telegram_bot.py" -Value "    await update.message.reply_text(welcome2, parse_mode='Markdown')"
-          Add-Content -Path "telegram_bot.py" -Value ""
-          Add-Content -Path "telegram_bot.py" -Value "async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):"
-          Add-Content -Path "telegram_bot.py" -Value '    """معالجة أمر /start"""'
-          Add-Content -Path "telegram_bot.py" -Value "    user = update.effective_user"
-          Add-Content -Path "telegram_bot.py" -Value "    "
-          Add-Content -Path "telegram_bot.py" -Value '    start_message = f"""'
-          Add-Content -Path "telegram_bot.py" -Value '🚀 **تم بدء البوت بنجاح!**'
-          Add-Content -Path "telegram_bot.py" -Value ''
-          Add-Content -Path "telegram_bot.py" -Value '👋 أهلاً {user.first_name}!'
-          Add-Content -Path "telegram_bot.py" -Value '    '
-          Add-Content -Path "telegram_bot.py" -Value '📋 **الأوامر المتاحة:**'
-          Add-Content -Path "telegram_bot.py" -Value '/start - بدء البوت'
-          Add-Content -Path "telegram_bot.py" -Value '/help - المساعدة'
-          Add-Content -Path "telegram_bot.py" -Value 'أي رسالة - سأرد بترحيب مزدوج!'
-          Add-Content -Path "telegram_bot.py" -Value ''
-          Add-Content -Path "telegram_bot.py" -Value '⚡ **البوت يعمل على خادم GitHub Actions**'
-          Add-Content -Path "telegram_bot.py" -Value '🖥️ **مع خادم RDP نشط**'
-          Add-Content -Path "telegram_bot.py" -Value '"""'
-          Add-Content -Path "telegram_bot.py" -Value "    "
-          Add-Content -Path "telegram_bot.py" -Value "    await update.message.reply_text(start_message, parse_mode='Markdown')"
-          Add-Content -Path "telegram_bot.py" -Value ""
-          Add-Content -Path "telegram_bot.py" -Value "async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):"
-          Add-Content -Path "telegram_bot.py" -Value '    """معالجة أمر /help"""'
-          Add-Content -Path "telegram_bot.py" -Value '    help_text = """'
-          Add-Content -Path "telegram_bot.py" -Value '🆘 **مساعدة البوت:**'
-          Add-Content -Path "telegram_bot.py" -Value ''
-          Add-Content -Path "telegram_bot.py" -Value '📝 **كيفية الاستخدام:**'
-          Add-Content -Path "telegram_bot.py" -Value '1. أرسل أي رسالة'
-          Add-Content -Path "telegram_bot.py" -Value '2. سأرد عليك برسالتين ترحيبيتين'
-          Add-Content -Path "telegram_bot.py" -Value '3. لا حاجة لأوامر معقدة'
-          Add-Content -Path "telegram_bot.py" -Value ''
-          Add-Content -Path "telegram_bot.py" -Value '🔧 **المميزات:**'
-          Add-Content -Path "telegram_bot.py" -Value '- رد فوري بدون تأخير'
-          Add-Content -Path "telegram_bot.py" -Value '- تشغيل مستمر 24/7'
-          Add-Content -Path "telegram_bot.py" -Value '- متكامل مع RDP'
-          Add-Content -Path "telegram_bot.py" -Value ''
-          Add-Content -Path "telegram_bot.py" -Value '📞 **لأي استفسار:** أرسل رسالة وسأرد فوراً!'
-          Add-Content -Path "telegram_bot.py" -Value '"""'
-          Add-Content -Path "telegram_bot.py" -Value "    "
-          Add-Content -Path "telegram_bot.py" -Value "    await update.message.reply_text(help_text, parse_mode='Markdown')"
-          Add-Content -Path "telegram_bot.py" -Value ""
-          Add-Content -Path "telegram_bot.py" -Value "# ==================== الدالة الرئيسية ===================="
-          Add-Content -Path "telegram_bot.py" -Value "def main():"
-          Add-Content -Path "telegram_bot.py" -Value '    """الدالة الرئيسية لتشغيل البوت"""'
-          Add-Content -Path "telegram_bot.py" -Value "    logger.info('بدء تشغيل بوت Telegram...')"
-          Add-Content -Path "telegram_bot.py" -Value "    "
-          Add-Content -Path "telegram_bot.py" -Value "    try:"
-          Add-Content -Path "telegram_bot.py" -Value "        # إنشاء التطبيق"
-          Add-Content -Path "telegram_bot.py" -Value "        application = Application.builder().token(TELEGRAM_TOKEN).build()"
-          Add-Content -Path "telegram_bot.py" -Value "        "
-          Add-Content -Path "telegram_bot.py" -Value "        # إضافة المعالجات"
-          Add-Content -Path "telegram_bot.py" -Value "        application.add_handler(CommandHandler('start', start_command))"
-          Add-Content -Path "telegram_bot.py" -Value "        application.add_handler(CommandHandler('help', help_command))"
-          Add-Content -Path "telegram_bot.py" -Value "        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))"
-          Add-Content -Path "telegram_bot.py" -Value "        "
-          Add-Content -Path "telegram_bot.py" -Value "        logger.info('البوت جاهز للاستقبال...')"
-          Add-Content -Path "telegram_bot.py" -Value "        "
-          Add-Content -Path "telegram_bot.py" -Value "        # بدء الاستماع للرسائل"
-          Add-Content -Path "telegram_bot.py" -Value "        application.run_polling(allowed_updates=Update.ALL_TYPES)"
-          Add-Content -Path "telegram_bot.py" -Value "        "
-          Add-Content -Path "telegram_bot.py" -Value "    except Exception as e:"
-          Add-Content -Path "telegram_bot.py" -Value "        logger.error(f'خطأ في تشغيل البوت: {e}')"
-          Add-Content -Path "telegram_bot.py" -Value "        raise"
-          Add-Content -Path "telegram_bot.py" -Value ""
-          Add-Content -Path "telegram_bot.py" -Value "# ==================== نقطة الدخول ===================="
-          Add-Content -Path "telegram_bot.py" -Value 'if __name__ == "__main__":'
-          Add-Content -Path "telegram_bot.py" -Value "    main()"
-          
-          Write-Host "✅ Telegram bot script created successfully!"
-
-      # ========================================
-      # الخطوة 4: تشغيل بوت Telegram في الخلفية
-      # ========================================
-      - name: Start Telegram Bot in Background
-        run: |
-          Write-Host "Starting Telegram Bot..."
-          
-          # تشغيل البوت في الخلفية
-          Start-Process python -ArgumentList "telegram_bot.py" -WindowStyle Hidden
-          
-          # الانتظار قليلاً للتأكد من بدء التشغيل
-          Start-Sleep -Seconds 10
-          
-          # التحقق من تشغيل البوت
-          $botProcess = Get-Process python -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -like "*telegram*" -or $_.ProcessName -eq "python"}
-          if ($botProcess) {
-              Write-Host "✅ Telegram Bot is running! (PID: $($botProcess.Id))"
-          } else {
-              Write-Host "⚠️ Bot process not found, trying to run directly..."
-              # تشغيل مباشر للتحقق
-              python telegram_bot.py &
-          }
-
-      # ========================================
-      # الخطوة 5: عرض معلومات الاتصال والحفاظ على التشغيل
-      # ========================================
-      - name: Maintain Both Services Running
-        run: |
-          Write-Host ""
-          Write-Host "╔══════════════════════════════════════════════════════╗"
-          Write-Host "║      ✅ جميع الخدمات تعمل بنجاح! ✅                  ║"
-          Write-Host "╚══════════════════════════════════════════════════════╝"
-          Write-Host ""
-          
-          Write-Host "=================== RDP ACCESS ==================="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: TOOLBOXLAP"
-          Write-Host "Password: admin@123"
-          Write-Host ""
-          
-          Write-Host "================ TELEGRAM BOT ===================="
-          Write-Host "Bot Token: 7548278006:AAEGJlnZ4hqwAlmJrHnKQ4R6zunDlPkyAyo"
-          Write-Host "Status: Running in background"
-          Write-Host "Features: Instant reply with double welcome messages"
-          Write-Host ""
-          
-          Write-Host "============== SYSTEM INFORMATION ==============="
-          Write-Host "Host: GitHub Actions Windows Runner"
-          Write-Host "Services: RDP Server + Telegram Bot"
-          Write-Host "Uptime: Will run for 60 hours (3600 minutes)"
-          Write-Host ""
-          
-          Write-Host "📌 للاتصال بـ RDP: استخدم العنوان أعلاه"
-          Write-Host "🤖 للاتصال بالبوت: أرسل أي رسالة إلى البوت"
-          Write-Host ""
-          
-          # عداد الوقت والحفاظ على التشغيل
-          $minutes = 0
-          while ($true) {
-              $minutes++
-              $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-              
-              if ($minutes % 30 -eq 0) {
-                  Write-Host ""
-                  Write-Host "════════════════════════════════════════════════"
-                  Write-Host "[$currentTime] النظام يعمل - $minutes دقيقة"
-                  Write-Host "════════════════════════════════════════════════"
-                  
-                  # التحقق من حالة البوت
-                  $botProcess = Get-Process python -ErrorAction SilentlyContinue | Select-Object -First 1
-                  if ($botProcess) {
-                      Write-Host "Telegram Bot: ✅ نشط (PID: $($botProcess.Id))"
-                  } else {
-                      Write-Host "Telegram Bot: ❌ متوقف، إعادة التشغيل..."
-                      Start-Process python -ArgumentList "telegram_bot.py" -WindowStyle Hidden
-                  }
-                  
-                  # التحقق من حالة RDP
-                  $rdpService = Get-Service TermService
-                  Write-Host "RDP Service: $($rdpService.Status)"
+              $timeout -= 5
+              try {
+                  $response = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
+                  $tunnelUrl = $response.tunnels[0].public_url -replace "tcp://", ""
+              } catch {
+                  $logContent = Get-Content ngrok.log -ErrorAction SilentlyContinue
+                  $tunnelUrl = $logContent | Select-String -Pattern "tcp://([a-zA-Z0-9\.\-]+:\d+)" | ForEach-Object { $_.Matches.Groups[1].Value }
               }
-              
-              Write-Host "[$currentTime] جميع الخدمات تعمل - اضغط Ctrl+C في GitHub لإيقاف"
-              Start-Sleep -Seconds 60
           }
+          if (-not $tunnelUrl) {
+              Write-Output "::error::Ngrok tunnel could not be created"
+              exit 1
+          }
+          Write-Output "============================================"
+          Write-Output "|| ✅ RDP Connection Details ||"
+          Write-Output "============================================"
+          Write-Output "Address: $tunnelUrl"
+          Write-Output "Username: kamel007"
+          Write-Output "Password: Kamel@123"
+          Write-Output "--------------------------------------------"
+          Write-Output "Instructions:"
+          Write-Output "1. Press Win + R, type 'mstsc' and press Enter"
+          Write-Output "2. Connect to: $tunnelUrl"
+          Write-Output "3. Use the credentials above"
+          Write-Output "============================================"
+          while ($true) {
+              Start-Sleep -Seconds 300
+          }
+
+      - name: Cleanup Ngrok
+        if: always()
+        run: |
+          Stop-Process -Name "ngrok" -Force -ErrorAction SilentlyContinue
